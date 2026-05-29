@@ -1,0 +1,10 @@
+torch>=2.0
+torchvision>=0.15
+numpy>=1.23
+Pillow>=9.0
+sentencepiece>=0.1.99
+einops>=0.4
+h5py>=3.7
+imageio>=2.25
+imageio-ffmpeg>=0.4
+tqdm>=4.60

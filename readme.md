@@ -28,6 +28,7 @@
 ---
 
 ## 🔥 News
+- **[2026-05]** We released the inference code and checkpoints for **GeoPredict**.
 - **[2026-02]** Our paper was accepted by CVPR2026 as a **Highlight** ! 🥳
 - **[2025-12]** We released the [paper](https://arxiv.org/pdf/2512.16811) and the [project page](https://jingjingqian75.github.io/GeoPredict-Page/) for **GeoPredict**.
 
@@ -49,9 +50,15 @@ GeoPredict addresses these limitations with:
 
 ## 📝 TODO
 - [x] Release paper and project page.
-- [ ] Release evaluation code. Expected in April 2026.
-- [ ] Release training code. Expected in May 2026.
-- [ ] Support more open-source VLA models, such as Pi0.5 and OpenVLA. Expected in June 2026.
+- [x] Release inference code and checkpoints.
+- [ ] Release training code. Expected in June 2026.
+- [ ] Support more open-source VLA models, such as Pi0.5 and OpenVLA. Expected in July 2026.
+
+---
+
+## 📚 Getting Started
+
+1. [Environment Setup & Inference](docs/infer.md)
 
 ---
 
