@@ -20,18 +20,9 @@ def transform_images(images, image_keys, train):
             image = image.reshape(-1, *original_shape[-3:])  # [N, C, H, W]
             batch_shape = image.shape[0]
 
-            if "wrist" not in key:
-                height, width = image.shape[-2:]
-                transform = transforms.Compose([
-                    transforms.RandomCrop((int(height * 0.95), int(width * 0.95))),
-                    transforms.Resize((height, width)),
-                    transforms.RandomRotation(degrees=5),
-                    transforms.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5),
-                ])
-            else:
-                transform = transforms.Compose([
-                    transforms.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5),
-                ])
+            transform = transforms.Compose([
+                transforms.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5),
+            ])
             
             # Apply transforms to each image in the batch
             transformed_images = []
