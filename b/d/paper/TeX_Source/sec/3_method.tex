@@ -1,0 +1,461 @@
+\section{Methodology}
+\label{sec:method}
+
+\begin{figure*}[htbp]
+  \centering
+  \includegraphics[width=0.99\textwidth]{fig/method.pdf}
+  \caption{\textbf{Overview of GeoPredict.} Given an instruction, multi-view images and motion history encoded by the Track Encoder, a central LLM Transformer learns two main tasks. First, it predicts multi-timestep 3D keypoint trajectories using learnable Future Track Query. Second, it forecasts future workspace geometry as a predictive 3D Gaussian by processing a 3D Spatial Query through a Voxel Decoder. A track-guided refinement mechanism leverages the predicted future tracks to allocate geometric capacity to task-relevant interaction regions. Our policy then generates the final action via an Action Expert. Crucially, these predictive modules serve exclusively as training-time supervision and are not invoked during inference, thus preserving efficiency.}
+\label{fig:method}
+\vspace{-15pt}
+\end{figure*}
+
+% 一段话简单介绍一下章节内容，结合图1给出方法的概况说明。
+
+% Our objective is to endow a Vision-Language-Action (VLA) policy with \emph{predictive spatial intelligence}: before committing to low-level control, the policy should form expectations about how the robot and the scene will evolve. To this end, we propose \textbf{GeoPredict}, a training-time world-model-augmented VLA framework that couples (i) trajectory-level kinematic forecasting for robot keypoints with (ii) predictive 3D Gaussian Splatting (3DGS) for future scene geometry. These two sources of foresight are injected into a language-conditioned, flow-matching action head. Crucially, all heavy 3D prediction components are used only during training; at inference, the system retains the efficiency of the VLA backbone.
+
+% We propose \textbf{GeoPredict}, a world-model-augmented Vision–Language–Action (VLA) framework that equips continuous control policies with predictive kinematic and geometric priors. GeoPredict jointly learns future robot keypoint trajectories and future scene geometry represented via 3D Gaussian Splatting (3DGS), and conditions the underlying VLA model on these predictive signals. Importantly, these predictive modules are applied only during training, while the action generation stage follows the standard VLA formulation.
+
+% We first present the problem setup and the VLA model we build upon (Sec.~\ref{sec:preliminary}). We then describe our trajectory-encoding and prediction module (Sec.~\ref{sec:track_query}), followed by our predictive 3D world model and refinement strategy (Sec.~\ref{sec:3dgs}). Finally, we outline the attention design, training objective, and inference process (Sec.~\ref{sec:train_infer}).
+
+We propose \textbf{GeoPredict}, a geometry-aware VLA framework that equips continuous-control policies with predictive kinematic and geometric priors. GeoPredict jointly learns future robot keypoint trajectories and future scene geometry through a 3DGS representation, and conditions the underlying VLA on these predictions. Notably, these predictive modules are used only during training, while the action generation process remains similar to a standard VLA policy.
+
+First, we describe the problem setup and the base VLA model (Sec.~\ref{sec:preliminary}). We then introduce our trajectory encoding and future motion prediction module (Sec.~\ref{sec:track_query}), followed by the predictive 3D Gaussian geometry and its refinement mechanism (Sec.~\ref{sec:3dgs}). Finally, we present the attention design, training objective and inference process (Sec.~\ref{sec:train_infer}).
+
+
+\subsection{Preliminary} \label{sec:preliminary}
+
+\textbf{Problem Definition.}
+%
+% The VLA paradigm~\cite{kim2025openvla,black2410pi0} aims to learn a policy $\bm{\pi}$ that maps a language instruction $\textbf{L}$, current observation $\textbf{O}_t$, and robot proprioception $\textbf{Q}_t$ to a continuous action chunk $\textbf{A}_t=[\textbf{a}_t,\textbf{a}_{t+1},...,\textbf{a}_{t+H-1}]$ (we use $H=50$ in our method).
+% Here, we use multi-view images $\mathbf{I}_t$ and joint coordinates $\mathbf{J}_t$ as $\mathbf{O}_t=(\mathbf{I}_t,\mathbf{J}_t)$. Each action $\mathbf{a}_t\in\mathbb{R}^{D}$ is a 7-DoF end-effector control vector
+% $\mathbf{a}_t=\{\Delta\mathbf{x},\Delta\bm{\theta},g\}$, where $\Delta \bm{x} \in \mathbb{R}^3$ is the control translation, $\Delta \bm{\theta} \in \mathbb{R}^3$ is the rotation offset (e.g., axis-angle or Euler representation), and $g \in \mathbb{R}$ represents the gripper's open-close state.  
+%
+The VLA paradigm~\cite{kim2025openvla,black2410pi0} aims to learn a policy $\bm{\pi}$ that maps a language instruction $\mathbf{L}$, the current multi-view image observation $\mathbf{I}_t$, and the robot’s proprioceptive state $\mathbf{Q}_t$ to a continuous action chunk $\mathbf{A}_t=[\mathbf{a}_t, \mathbf{a}_{t+1}, \ldots, \mathbf{a}_{t+H-1}]$, where we set $H=50$. 
+% The observation $\textbf{O}_t$ consists of multi-view images $\textbf{I}_t$ and joint coordinates $\textbf{J}_t$, i.e., $\textbf{O}_t=(\textbf{I}_t,\textbf{J}_t)$. 
+Each action $\mathbf{a}_t \in \mathbf{R}^{7}$ is a 7-DoF end-effector command $\mathbf{a}_t=\{\Delta\mathbf{x}, \Delta\bm{\theta}, g\}$,
+where $\Delta\mathbf{x}\in\mathbb{R}^3$ and $\Delta\bm{\theta}\in\mathbb{R}^3$ denote translational and rotational offsets (e.g., in axis–angle or Euler representation), and $g\in\mathbb{R}$ is the gripper's open-close state.
+
+% Traditional VLAs typically predict actions reactively from current observations. However, many manipulation tasks fundamentally require anticipating how the robot and the environment will change\sss{CHECK}. GeoPredict therefore conditions the policy not only on past observations but also on internally generated predictions of future motion and future scene geometry.
+
+While  VLAs generate actions reactively from the current observation, many manipulation tasks require anticipating how both the robot and the surrounding scene will evolve over time. Thus, GeoPredict augments the policy by conditioning not only on past observations but also on internally predicted future robot motion and future scene geometry.
+
+%
+% The standard paradigm for Vision-Language-Action (VLA) models~\cite{kim2025openvla, black2410pi0} aims to learn a policy $\bm{\pi}$ that maps a language instruction $\textbf{L}$, the current observation $\textbf{O}_t$ and the robot's proprioceptive state $\textbf{Q}_t$ to a continuous, low-level robot action chunk $\textbf{A}_t=[\textbf{a}_t,\textbf{a}_{t+1},...,\textbf{a}_{t+H-1}]$ (we use $H=50$ in our method). Here, the observation $\textbf{O}_t$ consists of multi-view images $\textbf{I}_t$ and the robot's joint coordinates $\textbf{J}_t$. The action $\textbf{a}_t \in \mathbb{R}^D$ defines the low-level control command, represented as a continuous vector $\textbf{a}_t = \{\Delta \bm{x}, \Delta \bm{\theta}, g\}$. This vector typically represents 7-DoF end-effector control, where $\Delta \bm{x} \in \mathbb{R}^3$ is the control translation, $\Delta \bm{\theta} \in \mathbb{R}^3$ is the rotation offset (e.g., axis-angle or Euler representation), and $g \in \mathbb{R}$ represents the gripper's open-close state. 
+%
+% Our model, GeoPredict, extends this basic definition by conditioning the policy  $\bm{\pi}$ not only on the past and present observations $\textbf{O}_{\leq t}$, but also on an internally generated \textit{prediction} of the future world state $\hat{\textbf{S}}_{t+k}$, which we formulate as a 3DGS world model.
+
+\textbf{Base VLA model.}
+We adopt $\pi_0$~\cite{black2410pi0} as the VLA base model. It comprises a VLM (PaliGemma~\cite{beyer2024paligemma} with a SigLIP vision encoder) and a robotics-specific \emph{action expert} that generates continuous actions via conditional flow matching~\cite{lipman2022flow}. Text, image, and proprioceptive tokens are projected into a shared space and processed by the transformer; the action expert then generates $\mathbf{A}_t$ by integrating a learned vector field from noise in a small, fixed number of steps.
+
+% GeoPredict augments this base VLA model with predictive components that influence the transformer’s internal representations, without altering how actions are ultimately drawn from the action expert.
+
+
+
+% \noindent \textbf{Vision-Language-Action Backbone.}
+% We select $\pi_0$~\cite{black2410pi0} as our Vision-Language-Action (VLA) backbone. $\pi_0$ consists of a core VLM (PaliGemma~\cite{beyer2024paligemma}, which utilizes a SigLIP vision encoder and a Gemma transformer backbone) and is augmented with robotics-specific components. Following a standard late fusion VLM recipe, vision encoder processes multi-view images $\textbf{I}_t$ and embed them into the same embedding space as the language tokens derived from the text instruction $\textbf{L}$. The robot's proprioceptive state $\textbf{Q}_t$ is also projected into this common embedding space. These multimodal tokens are fed into the central LLM Transformer backbone. Critically, unlike prior VLAs that employ autoregressive discretization for actions~\cite{kim2025openvla, bu2025univla}, $\pi_0$ is augmented with a novel \textbf{action expert}, which utilizes a separate set of weights for robotics-specific tokens, generates continuous action distributions via \textbf{conditional flow matching}~\cite{lipman2022flow}. This process generates actions at inference time by starting with random noise and iteratively integrating a learned vector field over a fixed number of steps (e.g., 10 steps) to produce the final, denoised action chunk.
+
+
+% \subsection{Track Encoder and Future Track Query} \label{sec:track_query}
+\subsection{Trajectory-Level Kinematic Prediction} \label{sec:track_query}
+% This section details the mechanisms for encoding historical motion and predicting future trajectories, which are essential for providing the model with kinematic priors and enabling predictive world modeling. We introduce a Track Encoder to compress past motion and a Future Track Query to generate future 3D point trajectories.
+
+
+% GeoPredict first models robot motion at the trajectory level. This provides a compact summary of past kinematics and an explicit prediction of future keypoint trajectories, which act both as a kinematic prior for action generation and as guidance for spatial refinement in the 3D world model.
+
+GeoPredict models robot motion at the trajectory level. This provides both a compact summary of past kinematics and an explicit prediction of future trajectories, serving as a kinematic prior for action generation and as guidance for spatial refinement in the following 3D Gaussian geometry module.
+
+
+
+\noindent \textbf{Track Encoder.}
+% The primary function of the Track Encoder is to distill the complete motion history of all relevant robot keypoints (joints and end-effectors) into a set of compact, fixed-dimensional tokens for consumption by the LLM Transformer. This historical context is critical because generating executable actions is fundamentally a task of predicting future trajectories. Given that joint movements possess inertia, these historical tokens provide a crucial kinematic prior, enabling the LLM to make physically plausible and informed predictions about future motion.
+%
+% The Track Encoder compresses the motion history of all robot keypoints into compact tokens for the transformer. This historical context serves as a kinematic prior: because joint motion exhibits inertia and action generation fundamentally involves forecasting trajectories, these tokens help the model make physically plausible and informed future motion predictions.
+%
+The Track Encoder compresses the motion history of all robot keypoints into compact tokens for the transformer. This historical context provides a strong kinematic prior: because joint motion exhibits inertia and action generation fundamentally involves forecasting future trajectories, encoding past dynamics enables the model to make more physically consistent motion predictions.
+
+
+% As illustrated in Figure~\ref{fig:method}, we track $K$ 3D keypoints ($N$ joints and $M$ end-effectors, where $K=N+M$). For each keypoint $k$, we record its 3D coordinates from time $0$ to $t-1$ (visualized as $t-50$ to $t-1$ in Figure~\ref{fig:method} for brevity), forming a historical trajectory $\bm{\mathcal{T}}_k \in \mathbb{R}^{(t-1) \times 3}$. These $K$ trajectories are the inputs to the Track Encoder. Inside the encoder, we initialize a shared, learnable \textit{history track query} $\textbf{Q}^{hist}$. This query performs cross-attention with the embedded 3D coordinates of each trajectory $\bm{\mathcal{T}}_k$ to compress the entire variable-length temporal history of that keypoint into a single \textit{history track token} $\textbf{Z}_k^{hist}$. These $K$ tokens are then passed as input to the LLM Transformer. The cross-attention mechanism for generating the $k$-th token is formally defined as:
+% \begin{equation}
+% \begin{aligned}
+% \mathbf{Z}_k^{hist} &= \text{CrossAttn}(\mathbf{Q}^{hist}, \bm{\mathcal{T}}_k) \\
+% &= \text{Softmax}\left(\frac{\mathbf{Q}^{hist} \textbf{K}_k^T}{\sqrt{d_k}}\right) \textbf{V}_k,
+% \end{aligned}
+% \end{equation}
+% where $\textbf{K}_k = \textbf{V}_k = \text{Embed}( \bm{\mathcal{T}}_k)$ are the key and value matrices derived from the embedded points, and $\mathbf{Q}^{hist}$ serves as the query. $d_k$ is the dimension of the key vector.
+
+% As illustrated in Figure~\ref{fig:method}, we track $K$ 3D keypoints (joints and end-effector points). 
+% For each keypoint $k\in\{1, ..., K\}$, we collect its 3D coordinates from time $0$ to $t-1$ into a trajectory $\bm{\mathcal{T}}_k \in \mathbb{R}^{(t-1) \times 3}$. 
+% %
+% A shared, learnable history query $\textbf{Q}^{hist}$ performs cross-attention over the embedded trajectory to compress it into a single token as:
+% \begin{equation}
+% \begin{aligned}
+% \mathbf{Z}_k^{hist} = \text{CrossAttn}(&\text{query}=\mathbf{Q}^{hist},
+% \text{key}= \text{MLP}(\bm{\mathcal{T}}_k),\\ &\text{value}=\text{MLP}(\bm{\mathcal{T}}_k)), \\
+% % &= \text{Softmax}\left(\frac{\mathbf{Q}^{hist} \textbf{K}_k^T}{\sqrt{d_k}}\right) \textbf{V}_k,
+% \end{aligned}
+% \end{equation}
+% where $d_k$ is the feature dimension, $\mathbf{Z}_k^{hist}$ is the compressed \textit{history track token}. These $K$ tokens encode inertia, joint limits, and other motion regularities in a compact form, and are appended to the LLM transformer input.
+
+As illustrated in Figure~\ref{fig:method}, we track $K$ 3D keypoints (joints and end-effector points). For each keypoint $k\in\{1,\ldots,K\}$, we collect its 3D coordinates from time $0$ to $t{-}1$ into a trajectory $\bm{\mathcal{T}}_k \in \mathbb{R}^{(t-1)\times 3}$. A shared learnable history query $\mathbf{Q}^{\text{hist}}$ performs cross-attention over the embedded trajectory to produce a single \textit{history track token}:
+\vspace{-10pt}
+\begin{equation}
+\begin{aligned}
+\mathbf{Z}_k^{\text{hist}}
+= \text{CrossAttn}\big(&\text{query}=\mathbf{Q}^{\text{hist}},\;
+\text{key}=\text{MLP}(\bm{\mathcal{T}}_k),\\
+&\text{value}=\text{MLP}(\bm{\mathcal{T}}_k)\big).
+\end{aligned}
+\end{equation}
+These $K$ history tokens encode inertia, joint limits, and motion regularities, and are appended to the transformer input.
+
+
+\noindent \textbf{Future Track Query.}
+% To achieve the goal of world modeling, we predict the future 3D trajectories for the same $K$ keypoints. We initialize a set of $K$ learnable \textit{future track queries}, $\textbf{Q}_{future} = \{\textbf{q}_k^{fut}\}_{k=1}^K$, which are fed as input to the LLM Transformer alongside the instruction, image, and history track tokens. Within the LLM Transformer, these queries interact with the full context (task instruction $\textbf{L}$, current visual observation $\textbf{I}_t$, and history track tokens $\{\textbf{Z}_k^{hist}\}$) to generate $K$ corresponding \textit{future track embeddings}, $\textbf{E}_{future} = \{\textbf{e}_k^{fut}\}_{k=1}^K$. Each embedding $\textbf{e}_k^{fut}$ represents a latent summary of the entire predicted future trajectory for keypoint $k$.
+%
+% To explicitly capture the future motion of these robot keypoints, we introduce $K$ learnable future track queries 
+% $\textbf{Q}_{future} = \{\textbf{q}_k^{fut}\}_{k=1}^K$. 
+% $\{\textbf{q}_k^{fut}\}_{k=1}^K$. 
+% These queries are input to the transformer together with $\textbf{L}$, $\mathbf{I}_t$, and $\mathbf{Z}_k^{hist}$. After passing through the transformer, each query produces a future track embedding $\textbf{e}_k^{fut}$, which represents a latent summary of the entire predicted future trajectory for keypoint $k$.
+%
+To explicitly capture future motion, we introduce $K$ learnable future track queries $\{\mathbf{q}_k^{\text{fut}}\}_{k=1}^K$. These queries are processed together with the instruction $\mathbf{L}$, current images $\mathbf{I}_t$, and history tokens $\{\mathbf{Z}_k^{\text{hist}}\}$, producing future track embeddings $\mathbf{e}_k^{\text{fut}}$ that summarize the latent predicted trajectory of each keypoint.
+
+
+% To decode this latent representation into an explicit spatio-temporal trajectory, 
+% we adopt a shared MLP on $\textbf{e}_k^{fut}$ to predict a total of $H+1$ 3D positions: one for the current time $t$ and $H$ for future timesteps $\{t+1,…,t+H\}$. We use a 1D sinusoidal temporal encoding $\text{\textbf{PE}}_{time} \in \mathbb{R}^{(H+1) \times C}$ to distinguish different timesteps, thus the predictions are given by: 
+% \begin{equation}
+% \label{eq:track}
+% \hat{\textbf{p}}_{k, t+\tau} = 
+% % \begin{cases} 
+% % \text{\small MLP}(\textbf{e}_k^{fut}), & \text{if } \tau = 0, \\
+% \text{\small MLP}(\textbf{e}_k^{fut} + \text{\small \textbf{PE}}_{time}[\tau]).
+% % \end{cases}
+% \end{equation}
+
+We decode each $\mathbf{e}_k^{\text{fut}}$ into an explicit spatio-temporal trajectory by using a shared MLP to predict $H{+}1$ timesteps, one for the current time $t$ and $H$ for future steps $\{t{+}1,\ldots,t{+}H\}$. A 1D sinusoidal temporal encoding $\mathbf{PE}^{\text{time}}\in\mathbb{R}^{(H+1)\times C}$ is then adopted as follows:
+\begin{equation}
+\label{eq:track}
+\hat{\mathbf{p}}_{k,t+\tau}
+= \text{MLP}\big(\mathbf{e}_k^{\text{fut}} + \mathbf{PE}^{\text{time}}[\tau]\big),
+\qquad \tau = 0,\ldots,H.
+\end{equation}
+
+% To decode this latent representation into an explicit spatio-temporal trajectory, we predict a total of $H+1$ points: the 3D coordinate for the current time $t$ and for $H$ future timesteps (e.g., $H=50$, representing timesteps $t+1$ to $t+H$). A shared Multi-Layer Perceptron (MLP) is used for decoding. The prediction for the current keypoint $\hat{\textbf{p}}_{k, t}$ is decoded directly from the future track embedding $\textbf{e}_k^{fut}$. For the $H$ future timesteps, we first add a 1D sinusoidal temporal positional encoding~\cite{vaswani2017attention} $\text{\textbf{PE}}_{time} \in \mathbb{R}^{H \times C}$ to the embedding. The predictions are given by:
+% \begin{equation}
+% \label{eq:track}
+% \hat{\textbf{p}}_{k, t+\tau} = 
+% \begin{cases} 
+% \text{\small MLP}(\textbf{e}_k^{fut}), & \text{if } \tau = 0 \\
+% \text{\small MLP}(\textbf{e}_k^{fut} + \text{\small \textbf{PE}}_{time}[\tau-1]), & \text{otherwise} 
+% \end{cases}
+% \end{equation}
+
+% During training, this entire predicted trajectory (from $t$ to $t+H$) is supervised using a standard Mean Squared Error loss between the predicted coordinates and the ground-truth coordinates $\textbf{p}^{gt}$. The loss is computed across all $K$ points and all $H+1$ timesteps in the horizon:
+% \begin{equation}
+% \mathcal{L}_{track} = \frac{1}{K \cdot (H+1)} \sum_{k=1}^{K} \sum_{\tau=0}^{H} \| \hat{\textbf{p}}_{k, t+\tau} - \textbf{p}_{k, t+\tau}^{gt} \|_2^2.
+% \label{eq:track_loss}
+% \end{equation}
+
+% During training, we supervise these predictions with a Mean Squared Error loss over all keypoints and timesteps:
+% \begin{equation}
+% \mathcal{L}_{track} = \frac{1}{K \cdot (H+1)} \sum_{k=1}^{K} \sum_{\tau=0}^{H} \| \hat{\textbf{p}}_{k, t+\tau} - \textbf{p}_{k, t+\tau}^{gt} \|_2^2,
+% \label{eq:track_loss}
+% \end{equation}
+% where  $\textbf{p}^{gt}$ is the ground-truth coordinates. This encourages the shared transformer backbone to represent motion in a predictive and dynamically consistent way and provides explicit future trajectories that will be reused in the following 3D world model.
+
+The predicted trajectories are supervised using a Mean Squared Error loss over all keypoints and timesteps as 
+\begin{equation}
+\label{eq:track_loss}
+\mathcal{L}_{\text{track}}
+= \frac{1}{K(H+1)}
+\sum_{k=1}^{K}\sum_{\tau=0}^{H}
+\|\hat{\mathbf{p}}_{k,t+\tau} - \mathbf{p}^{\text{gt}}_{k,t+\tau}\|_2^2.
+\end{equation}
+This encourages the shared transformer backbone to learn predictive, dynamically consistent motion representations and provides explicit future trajectories that will be used for predictive 3D Gaussian refinement.
+
+
+\subsection{Predictive 3D Gaussian Geometry} \label{sec:3dgs}
+% This section details our predictive 3D world model, which is designed to provide the robot with a precise and efficient representation of the scene. This model enables accurate spatial reasoning and the prediction of future scene states, which are critical for complex manipulation. The core components include a 3D spatial query, a voxel decoder to generate 3D Gaussian Splatting representations, a track-based refinement step for high-fidelity modeling of interaction areas, and a depth rendering module for supervision.
+
+% We now introduce a predictive 3D world model that estimates the future geometry of the robot workspace. By forecasting how the scene evolves, the model supports more accurate spatial reasoning and facilitates manipulation that depends on anticipating future object configurations. The module consists of four components: a 3D spatial query for scene encoding, a voxel decoder that predicts 3D Gaussian Splatting (3DGS) primitives, a track-guided refinement mechanism that increases fidelity around interaction regions, and a depth-rendering supervision objective.
+
+We now introduce a predictive 3D Gaussian geometry module that estimates the future geometry of the robot workspace. By anticipating how the scene will evolve, this module provides the policy with stronger spatial reasoning abilities, which is essential for manipulation tasks that reply on forecasting future object configurations. The module comprises four components: a 3D spatial query for encoding the robot workspace, a voxel decoder that produces 3D Gaussian Splatting (3DGS) primitives, a track-guided refinement mechanism for increasing fidelity near interaction regions, and a depth-rendering objective for supervision.
+
+\smallskip
+\noindent
+\textbf{3D Spatial Query.}
+% To enable the robot to precisely perceive the surrounding scene and target objects, an accurate and efficient 3D scene representation is required. To build this representation, we propose a 3D spatial query. First, we define the robot's operational workspace as a 3D volume with dimensions $H \times W \times D$ meters. We partition this spatial region into voxels of size $v$ meters, thereby obtaining a grid with a resolution of $(H/v) \times (W/v) \times (D/v)$. For computational efficiency, we downsample this grid by a factor of 4, yielding a spatial grid of size $N_x \times N_y \times N_z$, where $N_x = H/4v$, $N_y = W/4v$, and $N_z = D/4v$.
+%
+% To represent the workspace efficiently, we define a 3D volume of size $H \times W \times D$ meters and discretize it into voxels of size $v$, yielding a grid of resolution $(H/v) \times (W/v) \times (D/v)$. For token efficiency, this grid is downsampled by a factor of 4 in each dimension, producing a coarse grid of size $N_x \times N_y \times N_z$, where $N_x = H/4v$, $N_y = W/4v$, and $N_z = D/4v$.
+%
+To represent the workspace efficiently, we define a 3D volume of dimensions $H \times W \times D$ meters and discretize it into voxels of size $v$, yielding a grid resolution of $(H/v) \times (W/v) \times (D/v)$. For token efficiency, this high-resolution grid is downsampled by a factor of 4 along each axis, producing a coarse grid of size $N_x \times N_y \times N_z$, where $N_x = H/(4v)$, $N_y = W/(4v)$, and $N_z = D/(4v)$.
+
+
+% Each coarse voxel is associated with a learnable $C$-dimensional vector, thus we have the 3D spatial query embedding $\textbf{Q}_{init} \in \mathbb{R}^{N_x \times N_y \times N_z \times C}$. 
+% To inject a geometric prior and reduce the learning difficulty, we pre-calculate a 3D sinusoidal positional encoding $\textbf{PE}_{spatial} \in \mathbb{R}^{N_x \times N_y \times N_z \times C}$ by concatenating independent 1D sinusoidal encodings along the $X$, $Y$, and $Z$ axes, i.e., $\textbf{PE}_{spatial}(x, y, z) = \text{Concat}(\text{\textbf{PE}}_x(x), \text{\textbf{PE}}_y(y), \text{\textbf{PE}}_z(z))$. This encoding is added to the initialized queries as follows
+% \begin{equation}
+% \textbf{Q}_{spatial}(x,y,z) = \textbf{Q}_{init}(x,y,z) + \textbf{\small PE}_{spatial}(x,y,z).
+% \end{equation}
+% % Finally, the 3D spatial queries are flattened into a sequence of $N_x \times N_y \times N_z$ tokens and fed into the LLM Transformer.
+
+
+Each coarse voxel is assigned a learnable $C$-dimensional embedding, forming the initial spatial query tensor $\mathbf{Q}^{\text{init}} \in \mathbb{R}^{N_x \times N_y \times N_z \times C}$. To incorporate geometric structure and reduce learning difficulty, we add a 3D sinusoidal positional encoding $\mathbf{PE}^{\text{spatial}}\in \mathbb{R}^{N_x \times N_y \times N_z \times C}$, constructed by concatenating independent 1D sinusoidal encodings along the $x$, $y$, and $z$ axes:
+$
+\mathbf{PE}^{\text{spatial}}[i,j,k]
+= \text{Concat}\big(\mathbf{PE}^\text{x}[i],\; \mathbf{PE}^\text{y}[j],\; \mathbf{PE}^\text{z}[k]\big).
+$
+Hence, the final spatial query is obtained by
+\begin{equation}
+\mathbf{Q}^{\text{spatial}}[i,j,k]
+= \mathbf{Q}^{\text{init}}[i,j,k] + \mathbf{PE}^{\text{spatial}}[i, j,k].
+\end{equation}
+%
+All spatial queries are flattened into a sequence of  $N_x N_y  N_z$  tokens and provided to the transformer together with the instruction, current observations and history track tokens.
+
+ 
+% For each voxel in this downsampled grid, we randomly initialize a $C$-dimensional vector, $\textbf{Q}_{init} \in \mathbb{R}^C$, where $C$ is the embedding dimension of the LLM Transformer. To inject a geometric prior and reduce the learning difficulty, we pre-calculate a 3D sinusoidal positional encoding $\textbf{PE}_{spatial} \in \mathbb{R}^{N_x \times N_y \times N_z \times C}$. $\textbf{PE}_{spatial}$ is constructed by concatenating three separate 1D sinusoidal embeddings for each dimension ($x, y, z$). Let $C = C_x + C_y + C_z$, where $C_x, C_y, C_z$ are the respective embedding dimensions for the $x, y, z$ coordinates. The 1D \textbf{PE} for a given dimension (e.g., $x$) with position $pos$ is denoted as $\text{\textbf{PE}}_x(pos)$. The final 3D \textbf{PE} for a voxel at $(x, y, z)$ is the concatenation: $\textbf{PE}_{spatial}(x, y, z) = \text{Concat}(\text{\textbf{PE}}_x(x), \text{\textbf{PE}}_y(y), \text{\textbf{PE}}_z(z))$. This encoding is added to the initialized queries: 
+% \begin{equation}
+% \textbf{Q}_{spatial}(x,y,z) = \textbf{Q}_{init}(x,y,z) + \textbf{\small PE}_{spatial}(x,y,z).
+% \end{equation}
+
+% Finally, the 3D spatial queries are flattened into a sequence of $N_x \times N_y \times N_z$ tokens and fed into the LLM Transformer.
+
+\smallskip
+\noindent \textbf{Voxel Decoder.}
+% The 3D spatial queries $\textbf{Q}_{spatial}$ interact with the task instruction $\textbf{L}$, current observation $\textbf{I}_t$, history track tokens $\{\textbf{Z}_k^{hist}\}$ and $\textbf{Q}_{future}$ within the LLM, producing 3D spatial embeddings $\textbf{E}_{spatial} \in \mathbb{R}^{(N_x N_y N_z) \times C}$. To predict scene changes for the current time $t$ and $H$ future timesteps, we utilize 1D sinusoidal temporal positional encodings. The embedding $\textbf{E}_{spatial}$ represents the current time $t$. For future timesteps $\tau \in \{1,..., H\}$, we compute the future embedding $\textbf{E}_{spatial, t+\tau} = \textbf{E}_{spatial} + \textbf{PE}_{time}[\tau-1]$, where $\textbf{PE}_{time}$ is the same temporal positional encoding as used in Equation \eqref{eq:track}.
+%
+% After multi-layer attention, we obtain a set of spatial embeddings $\textbf{E}_{spatial} \in \mathbb{R}^{(N_x N_y N_z) \times C}$ that summarize the scene representation at time $t$. To model future geometry, we reuse the temporal positional encoding $\textbf{PE}_{time}$ as in Equation \eqref{eq:track}. Thus, for $\tau \in \{0,…,H\}$, we construct temporally shifted embeddings $\textbf{E}_{spatial, t+\tau} = \textbf{E}_{spatial} + \textbf{PE}_{time}[\tau]$. 
+% %
+% % For each of the $H+1$ timesteps, we reshape the flattened embeddings back to their 3D grid structure ($N_x \times N_y \times N_z \times C$). Composed of 3D transposed convolutions and upsampling layers, the 3D Voxel Decoder upsamples the grid to the original resolution of $(H/v) \times (W/v) \times (D/v)$. This process yields a voxel feature grid as following:
+% %
+% For each of the $H+1$ timesteps, we reshape $\textbf{E}_{spatial, t+\tau}$ into a 3D grid of size $N_x \times N_y \times N_z$. A 3D voxel decoder composed of transposed convolutions and upsampling layers then upsamples this grid back to the original voxel resolution $(H/v) \times (W/v) \times (D/v)$, yielding a voxel feature volume
+% \begin{equation}
+% \textbf{F}_{voxel} \in \mathbb{R}^{(H/v) \times (W/v) \times (D/v) \times C'},
+% \end{equation}
+% where $C'$ is the feature dimension of the voxel feature grid. 
+% A final 3D convolutional layer then processes this feature grid; for each voxel $(i,j,k)$, it utilizes the $C'$-dimensional feature vector $\textbf{F}_{voxel}(i,j,k)$ to generate a set of $N_G$ Gaussian primitives. Following the 3DGS formulation~\cite{kerbl20233d}, each primitive $\bm{g}$ is defined by its parameters:
+%
+After multi-layer attention, we obtain spatial embeddings $\mathbf{E}^{\text{spatial}} \in \mathbb{R}^{(N_x N_y N_z) \times C}$ that summarize the workspace representation at time $t$. To model future geometry, we reuse the temporal positional encoding $\mathbf{PE}^{\text{time}}$ from Eq.~\eqref{eq:track} and construct temporally shifted embeddings
+\begin{equation}
+\mathbf{E}^{\text{spatial}}_{t+\tau} = \mathbf{E}^{\text{spatial}} + \mathbf{PE}^{\text{time}}[\tau], \quad \tau=0,\ldots,H.
+\end{equation}
+Each $\mathbf{E}^{\text{spatial}}_{t+\tau}$ is reshaped into a grid of size $N_x \times N_y \times N_z$ and passed through a 3D voxel decoder composed of transposed convolutions and upsampling layers, which restores the original voxel resolution $(H/v) \times (W/v) \times (D/v)$. This yields a dense voxel feature volume
+\begin{equation}
+\mathbf{F}^{\text{voxel}} \in \mathbb{R}^{(H/v) \times (W/v) \times (D/v) \times C'},
+\end{equation}
+where $C'$ is the feature dimension of the voxel feature grid. 
+
+% Then, a final 3D convolution layer maps each voxel feature $\textbf{F}_{voxel}(i,j,k)$ to a set of $N_G$ Gaussian primitives. Following the 3DGS formulation~\cite{kerbl20233d}, each primitive $\bm{g}$ is parameterized as
+% \begin{equation}
+% \bm{g} = \{\bm{\mu}, \alpha, \bm{\Sigma}\},
+% \end{equation}
+% where $\bm{\mu} \in \mathbb{R}^3$ is the 3D center, $\alpha \in \mathbb{R}$ is the opacity, and $\bm{\Sigma} \in \mathbb{R}^{3 \times 3}$ is the covariance matrix. 
+% Since our GeoPredict focuses only on the scene's spatial and geometric properties, we omit color coefficients for each Gaussian primitive. The collection of all Gaussian primitives generated from all voxels at a given timestep $t+\tau$ constitutes the initial 3D scene representation $\textbf{G}^{init}_{t+\tau}$.
+% Since we focus on the scene's spatial and geometric properties, we omit color coefficients. The union of all Gaussians over voxels at time $t+\tau$ forms the initial 3D scene representation  $\textbf{G}^{init}_{t+\tau}$.
+
+A final 3D convolution maps each voxel feature $\mathbf{F}^{\text{voxel}}[i,j,k]$ to a set of $N_G$ Gaussian primitives. Following the 3DGS formulation~\cite{kerbl20233d}, each primitive
+$
+\mathbf{g}=\{\bm{\mu},\,\alpha,\,\bm{\Sigma}\}
+$
+has a 3D center $\bm{\mu}\in\mathbb{R}^3$, an opacity $\alpha\in\mathbb{R}$, and a covariance matrix $\bm{\Sigma}\in\mathbb{R}^{3\times 3}$. Because our focus is on geometry rather than appearance, we omit color coefficients. The union of Gaussians over all voxels forms the initial 3D scene representation $\mathbf{G}^{\text{init}}_{t+\tau}$.
+
+\smallskip
+\noindent \textbf{Track-based Gaussian Refinement.}
+% To successfully complete the task, such as grasping the corn and placing it in the sink as shown in Figure~\ref{fig:method}, the robot requires a highly precise geometric understanding of the target object and its destination. The end-effector's immediate interaction space demands finer-grained scene modeling than the global representation. Therefore, we propose to refine the 3D space intersected by the $K$ predicted future 3D keypoint trajectories originating from Section~\ref{sec:track_query}.
+% For many manipulation tasks, a coarse global scene representation is adequate, but precise geometry is essential in regions of interaction—particularly near the end-effector and target objects. Therefore, we propose to adaptively refine the 3D representation by leveraging the predicted future keypoint trajectories from Sec.~\ref{sec:track_query}.
+%
+While a coarse global representation is often sufficient for capturing the overall workspace, accurate manipulation requires high-fidelity geometry near regions of interaction, particularly around the end-effector, joints, and task-relevant objects. We therefore refine the Gaussian representation adaptively using the predicted future keypoint trajectories from Sec.~\ref{sec:track_query}.
+
+
+
+% Specifically, at timestep $t+\tau$, we have the initial Gaussian set $\textbf{G}^{init}_{t+\tau}$, and the $K$ predicted keypoint positions $\textbf{P}_{t+\tau} = \{\hat{\textbf{p}}_{k, t+\tau}\}_{k=1}^K$. We define a binary refinement mask $\textbf{M}_{refine}$ over the voxel grid, thus for each voxel $\bm{\mathcal{V}}(i,j,k)$: 
+% \begin{equation}
+% \small
+% \textbf{M}_{refine}(i,j,k) = \begin{cases} 1 & \text{if } \exists \textbf{p} \in \textbf{P}_{t+\tau} \text{ s.t. } \textbf{p} \in \bm{\mathcal{V}}(i,j,k), \\ 0 & \text{otherwise}. \end{cases}
+% \end{equation}
+
+At timestep $t+\tau$, given the initial Gaussian set $\mathbf{G}^{\text{init}}_{t+\tau}$ and the predicted keypoint positions $\mathbf{P}_{t+\tau}=\{\hat{\mathbf{p}}_{k,t+\tau}\}_{k=1}^{K}$, we define a binary refinement mask for each voxel $\bm{\mathcal{V}}[i,j,k]$:
+\begin{equation}
+\small
+\mathbf{M}^{\text{refine}}[i,j,k]=
+\begin{cases}
+1, & \text{if } \exists\, \mathbf{p}\in \mathbf{P}_{t+\tau} ~~\text{s.t.}~~ \mathbf{p}\in \bm{\mathcal{V}}[i,j,k], \\
+0, & \text{otherwise}.
+\end{cases}
+\end{equation}
+
+
+% At any given timestep $t+\tau$, the model has generated two distinct predictive outputs: the initial set of Gaussian primitives $\textbf{G}^{init}_{t+\tau}$ derived from the global voxel feature grid $\textbf{F}_{voxel}$, and the $K$ predicted 3D keypoint positions, $\textbf{P}_{t+\tau} = \{\hat{\textbf{p}}_{k, t+\tau}\}_{k=1}^K$. To identify the regions for refinement, we define a binary mask $\textbf{M}_{refine}$ over the voxel grid $\bm{\mathcal{V}}$:
+% \begin{equation}
+% \small
+% \textbf{M}_{refine}(i,j,k) = \begin{cases} 1 & \text{if } \exists \textbf{p} \in \textbf{P}_{t+\tau} \text{ s.t. } \textbf{p} \in \bm{\mathcal{V}}(i,j,k) \\ 0 & \text{otherwise} \end{cases}
+% \end{equation}
+
+% For each voxel $(i,j,k)$ where $\textbf{M}_{refine}(i,j,k) = 1$, we use a shared MLP to process its $C'$-dimensional feature vector $\textbf{F}_{voxel}(i,j,k)$ and output $N_G'$ additional finer-grained Gaussian primitives, where $N_G' > N_G$. The total set of Gaussians $\textbf{G}^{total}_{t+\tau}$ for that timestep is the union of the original global set $\textbf{G}^{init}_{t+\tau}$ and the new refined sets $\textbf{G}^{refine}_{t+\tau}$.
+
+% For each voxel with $\textbf{M}_{refine}(i,j,k) = 1$, we apply a shared MLP to its voxel feature $\textbf{F}_{voxel}(i,j,k)$ to generate an additional $N_G'$ finer-grained Gaussian primitives, where $N_G' > N_G$. Collecting these over all refined voxels yields a refined set $\textbf{G}^{refine}_{t+\tau}$. The total set of Gaussians at time $t+\tau$ is then 
+% $\textbf{G}^{total}_{t+\tau}=\textbf{G}^{init}_{t+\tau} \cup \textbf{G}^{refine}_{t+\tau}$.
+
+For each voxel with $\mathbf{M}^{\text{refine}}[i,j,k]=1$, a shared MLP maps $\mathbf{F}^{\text{voxel}}[i,j,k]$ to an additional $N_G'$ finer-grained Gaussian primitives ($N_G' > N_G$), yielding a refined set $\mathbf{G}^{\text{refine}}_{t+\tau}$. The complete Gaussian representation for timestep $t+\tau$ is 
+\vspace{-3pt}
+\begin{equation}
+\mathbf{G}^{\text{total}}_{t+\tau}
+= \mathbf{G}^{\text{init}}_{t+\tau} \cup \mathbf{G}^{\text{refine}}_{t+\tau}.
+\vspace{-3pt}
+\end{equation}
+
+% This track-guided refinement concentrates modeling capacity on predicted interaction regions, improving geometric accuracy around the robot’s future path without incurring the cost of globally high resolution.
+
+This track-guided refinement concentrates modeling capacity near predicted interaction regions, improving geometric accuracy along the robot's anticipated motion path without requiring a globally high-resolution scene model.
+
+\noindent 
+\textbf{Future Depth Rendering.}
+% To train the predictive 3DGS model, we render depth maps from $\textbf{G}^{total}_{t+\tau}$ for all $H+1$ timesteps by using differentiable alpha compositing, following the rendering principles of 3D Gaussian Splatting~\cite{kerbl20233d}. 
+% %
+% Specifically, for a given camera and timestep $t+\tau$, we consider a pixel ray $\textbf{r}$ and collect all Gaussians whose projected ellipses intersect $\textbf{r}$ into a set  $\mathcal{N}$ and are sorted by depth (front-to-back). Let $d_i$ be the depth of the center $\bm{\mu}_i$ of the $i-$th Gaussian, and $\alpha_i$ its opacity. The accumulated transmittance $T_i$ is defined as
+% \begin{equation}
+% T_i = \prod_{j=1}^{i-1} (1 - \alpha_j),
+% \end{equation}
+% which indicates the probability that the ray passes through all $j=1$ to $i-1$ primitives that are in front of primitive $i$.
+% The rendered depth for ray $\textbf{r}$ is
+% \begin{equation}
+% \hat{\textbf{D}}(\textbf{r}) = \sum_{i \in \mathcal{N}} T_i \alpha_i d_i.
+% \end{equation}
+% Note that as we focus on geometry, we do not render colors.
+%
+To supervise the predictive 3DGS model, we render depth maps from $\mathbf{G}^{\text{total}}_{t+\tau}$ at all $H{+}1$ timesteps using differentiable alpha compositing, following the rendering formulation of 3D Gaussian Splatting~\cite{kerbl20233d}. For a given camera and timestep $t{+}\tau$, we consider a pixel ray $\mathbf{r}$ and collect all Gaussians whose projected ellipses intersect the ray into a set $\mathcal{N}$, sorted in front-to-back order. For the $i$-th Gaussian, let $d_i$ denote the depth of its center $\bm{\mu}_i$ and $\alpha_i$ its opacity. The accumulated transmittance is
+\vspace{-5pt}
+\begin{equation}
+T_i \;=\; \prod_{j=1}^{i-1} (1 - \alpha_j),
+\vspace{-5pt}
+\end{equation}
+representing the probability that the ray passes through all primitives in front of the $i$-th one. The rendered depth for ray $\mathbf{r}$ is then
+\vspace{-5pt}
+\begin{equation}
+\vspace{-5pt}
+\hat{\mathbf{D}}(\mathbf{r}) \;=\; \sum_{i\in\mathcal{N}} T_i\,\alpha_i\, d_i.
+\end{equation}
+Since we focus on geometry prediction, colors are omitted.
+% Since our objective is purely geometric prediction, .
+
+
+
+% To train this predictive 3D Gaussian model, we render depth maps from the refined Gaussian sets $\{\textbf{G}^{total}_{t+\tau}\}$ for all $H+1$ timesteps. For a given camera viewpoint at time $t+\tau$, the depth $\hat{\textbf{D}}(\textbf{r})$ for a pixel ray $\textbf{r}$ is computed using differentiable alpha compositing, following the rendering principles of 3D Gaussian Splatting~\cite{kerbl20233d}. Specifically, for a ray $\textbf{r}$, all Gaussian primitives from the set $\textbf{G}^{total}_{t+\tau}$ that project onto its pixel are collected into a set $\mathcal{N}$ and are sorted by depth (front-to-back). The final depth $\hat{\textbf{D}}(\textbf{r})$ is the alpha-composited sum of the individual Gaussian depths $d_i$, where $d_i$ is the depth of the $i$-th Gaussian's center $\bm{\mu}_i$. As we are rendering geometry and not appearance, the color coefficients are omitted~\cite{kerbl20233d}. The rendered depth is calculated as:
+% \begin{equation}
+% \hat{\textbf{D}}(\textbf{r}) = \sum_{i \in \mathcal{N}} T_i \alpha_i d_i
+% \end{equation}
+% \text{where}
+% \begin{equation}
+% T_i = \prod_{j=1}^{i-1} (1 - \alpha_j)
+% \end{equation}
+% Here, $\alpha_i$ is the opacity of the $i$-th Gaussian primitive, and $T_i$ represents the accumulated transmittance, which is the probability that the ray passes through all $j=1$ to $i-1$ primitives that are in front of primitive $i$.
+
+
+% To avoid supervising irrelevant regions, we restrict the depth supervision to the robot’s operational workspace $H \times W \times D$. For each ray $\textbf{r}$, we back-project the depth to obtain a 3D point $\textbf{p}_{3d}(\textbf{r})$. If $\textbf{p}_{3d}(\textbf{r})$ lies inside the predefined workspace, we set a spatial mask $\textbf{M}_{spatial}(\textbf{r})= 1$; otherwise $\textbf{M}_{spatial}(\textbf{r}) = 0$. The depth loss $\mathcal{L}_{depth}$ is then computed as a masked L1 loss over all cameras and timesteps, normalized by the number of valid pixels as 
+% \begin{equation}
+% \label{eq:depth_loss}
+% \begin{split}
+% \mathcal{L}_{depth} &= \frac{1}{\sum \textbf{M}_{spatial}} \sum_{\tau=0}^{H} \sum_{c=1}^{N_{cam}} \sum_{\textbf{r} \in \text{pixels}} \\
+% &\textbf{M}_{spatial}(\textbf{r}) \cdot | \hat{\textbf{D}}_{c, t+\tau}(\textbf{r}) - \textbf{D}^{gt}_{c, t+\tau}(\textbf{r}) |.
+% \end{split}
+% \end{equation}
+% This loss encourages the 3D Gaussian representation to accurately predict the evolution of scene geometry in regions relevant to manipulation.
+
+To restrict supervision to regions relevant for manipulation, we apply a spatial mask over the robot’s operational workspace. For each ray $\mathbf{r}$, we back-project the depth value to obtain a 3D point $\mathbf{p}_{3d}(\mathbf{r})$. If this point lies within the predefined workspace, we set $\mathbf{M}^{\text{spatial}}(\mathbf{r})=1$; otherwise, $\mathbf{M}^{\text{spatial}}(\mathbf{r})=0$. The depth loss is formulated as a masked L1 loss over all cameras and timesteps:
+\vspace{-5pt}
+\begin{equation}
+\vspace{-5pt}
+\label{eq:depth_loss}
+\begin{split}
+\mathcal{L}_{\text{depth}}
+&= \frac{1}{\sum \mathbf{M}^{\text{spatial}}}
+\sum_{\tau=0}^{H} \sum_{c=1}^{N_{cam}} \sum_{\mathbf{r} \in \text{pixels}}\\
+&\mathbf{M}^{\text{spatial}}(\mathbf{r})\,
+\big| \hat{\mathbf{D}}_{c,t+\tau}(\mathbf{r})
+- \mathbf{D}^{\text{gt}}_{c,t+\tau}(\mathbf{r}) \big|.
+\end{split}
+\end{equation}
+This loss encourages the predicted 3D Gaussian representation to accurately capture the evolution of workspace geometry in regions relevant to downstream manipulation.
+
+% We supervise the rendered depth $\hat{\textbf{D}}$ against the ground-truth depth $\textbf{D}^{gt}$ using an L1 loss. Critically, we apply a spatial mask $\textbf{M}_{spatial}$ to the loss calculation. For each pixel, we compute its corresponding 3D position $\textbf{p}_{3d}(\textbf{r})$. The loss is only computed if this point falls within the robot's defined $H \times W \times D$ operational workspace:
+% \begin{equation}
+% \textbf{M}_{spatial}(\textbf{r}) = \begin{cases} 1 & \text{if } \textbf{p}_{3d}(\textbf{r}) \in \text{Workspace} \\ 0 & \text{otherwise} \end{cases}
+% \end{equation}
+% The final depth loss $\mathcal{L}_{depth}$, computed over $N_{cam}$ cameras and $H+1$ timesteps is:
+% \begin{equation}
+% \label{eq:depth_loss}
+% \begin{split}
+% \mathcal{L}_{depth} = \frac{1}{\sum \textbf{M}_{spatial}} \sum_{\tau=0}^{H} \sum_{c=1}^{N_{cam}} \sum_{\textbf{r} \in \text{pixels}} \\
+% \cdot \textbf{M}_{spatial}(\textbf{r}) \cdot | \hat{\textbf{D}}_{c, t+\tau}(\textbf{r}) - \textbf{D}^{gt}_{c, t+\tau}(\textbf{r}) |.
+% \end{split}
+% \end{equation}
+
+
+\subsection{Training and Inference} \label{sec:train_infer}
+% We now introduce how the kinematic and geometric modules are integrated into the transformer via a block-wise causal attention mechanism, and how we jointly train and efficiently deploy the model.
+
+We now introduce how the kinematic and geometric prediction modules are integrated into the transformer via a block-wise causal attention mechanism, and how the full system is jointly trained and deployed efficiently.
+
+\noindent
+\textbf{Block-wise Causal Attention Mechanism.}
+% As illustrated in Figure~\ref{fig:attention}, we utilize a block-wise causal attention mechanism within the LLM Transformer, adapted from the design principles of $\pi_0$~\cite{black2410pi0}. The transformer tokens are partitioned into five conceptual blocks, processed in a strict causal order: \textit{2D Token}, \textit{3D Token}, \textit{3D Query}, \textit{State Token}, and \textit{Action Noise}. For visual simplicity in Figure~\ref{fig:attention}, the detailed attention pathways from the \textit{3D Token} and \textit{State Token} blocks to others are not fully drawn; however, their interactions adhere to the same block-wise causal mechanism.
+%
+%
+We adopt a block-wise causal attention structure adapted from $\pi_0$ as shown in Figure~\ref{fig:attention}, in which the full token sequence is partitioned into five conceptually ordered groups: (1) 2D Token (text and image tokens), (2) 3D Token (history track tokens), (3) 3D Query tokens (future track queries and spatial queries), (4) State Token (proprioceptive token) and (5) Action Noise tokens (used by flow matching). Attention is fully bidirectional within each block, enabling rich intra-block interactions, while cross-block attention is strictly causal: tokens in a given block may attend only to tokens within the same block or to those in preceding blocks.
+
+% This organization enforces a perceptual-to-predictive-to-control hierarchy. The transformer first fuses 2D evidence from language and multi-view images, then integrates 3D kinematic history, then forms future predictions in 3D (both trajectories and spatial fields), then incorporates the current robot state, and finally generates an action in the action noise block conditioned on all preceding information. Predictive kinematic and geometric representations thus occupy an explicit intermediate stage that shapes the final control decision.
+
+%This organization imposes a perceptual-to-predictive-to-control hierarchy. The transformer first fuses 2D observations from language and multi-view images, then incorporates 3D kinematic history, then forms predictive 3D representations (future trajectories and spatial fields), then integrates the current proprioceptive state, and finally generates an action in the action-noise block. The predictive kinematic and geometric modules thus occupy an explicit intermediate stage, shaping the control decision by injecting structured motion and geometry priors directly into the transformer computation.
+
+This organization imposes a perceptual-to-predictive-to-control hierarchy. The transformer fuses 2D language and multi-view observations, incorporates 3D kinematic history, forms predictive 3D representations (future trajectories and spatial fields), integrates current proprioception, and generates an action via the action-noise block. The predictive modules thus occupy an intermediate stage, shaping control by injecting structured motion and geometry priors into the transformer.
+
+
+
+% Attention is fully bidirectional \textit{within} each block, but strictly causal \textit{between} blocks, meaning tokens only attend to their own block or preceding ones. This partitioning isolates the \textit{3D Token} block to manage the domain shift from 2D text and image inputs to 3D kinematic history, and the \textit{3D Query} block, which consists of learnable parameters rather than direct inputs. This causal structure enforces a strict computational hierarchy: the model processes 2D and 3D contexts, forms 3D predictions, and integrates its state, before finally generating an action conditioned on all preceding information.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.47\textwidth]{fig/attention.pdf}
+  \caption{\textbf{Block-wise Causal Attention Mechanism.} For simplicity, the detailed attention pathways from the 3D Token and State Token blocks to other blocks are not fully drawn.}
+  \label{fig:attention}
+  \vspace{-10pt}
+\end{figure}
+
+
+\noindent
+\textbf{Training Objective.}
+% The model is trained end-to-end with a composite loss function $\mathcal{L}_{total}$, which is a weighted sum of three components:
+% We train the entire model end-to-end with a weighted sum of three losses:
+% \begin{equation}
+%     \mathcal{L}_{total} = \lambda_{1} \mathcal{L}_{action} + \lambda_{2} \mathcal{L}_{track} + \lambda_{3} \mathcal{L}_{depth}
+%     \label{eq:total_loss}
+% \end{equation}
+% Here, $\mathcal{L}_{action}$ is the conditional flow-matching loss from the $\pi_0$ backbone (for continuous action generation), $\mathcal{L}_{track}$ is the keypoint trajectory loss as in Equation~\ref{eq:track_loss}, and $\mathcal{L}_{depth}$ is the depth rendering loss as in Equation~\ref{eq:depth_loss}. The weights $\lambda_{1}$, $\lambda_{2}$, and $\lambda_{3}$ balance the contributions of action, kinematic, and geometric supervision.
+%
+We train the model end-to-end using a weighted sum of three loss terms:
+\vspace{-5pt}
+\begin{equation}
+    \mathcal{L}_{\text{total}}
+    = \lambda_{1}\mathcal{L}_{\text{action}}
+    + \lambda_{2}\mathcal{L}_{\text{track}}
+    + \lambda_{3}\mathcal{L}_{\text{depth}},
+    \label{eq:total_loss}
+    \vspace{-5pt}
+\end{equation}
+where $\mathcal{L}_{\text{action}}$ is the continuous conditional flow-matching loss from $\pi_0$, $\mathcal{L}_{\text{track}}$ is the trajectory prediction loss defined in Eq.~\ref{eq:track_loss}, and $\mathcal{L}_{\text{depth}}$ is the masked depth-rendering loss from Eq.~\ref{eq:depth_loss}. The coefficients $\lambda_{1}$, $\lambda_{2}$, and $\lambda_{3}$ balance supervision from action, kinematic, and geometric signals.
+
+
+
+% Here $\mathcal{L}_{action}$ is the conditional flow matching loss from our $\pi_0$ backbone~\cite{black2410pi0}. $\mathcal{L}_{track}$ is the Mean Squared Error loss for the predicted 3D keypoint trajectories, as defined in Equation~\ref{eq:track_loss}. $\mathcal{L}_{depth}$ is the masked L1 loss for the rendered future depth maps, as defined in Equation~\ref{eq:depth_loss}. The terms $\lambda_{1}$, $\lambda_{2}$, and $\lambda_{3}$ are scalar weights that balance each component.
+
+\noindent
+\textbf{Inference.}
+% During inference, we first feed all context tokens including text, image, history track and 3D query into the LLM Transformer in a \textit{single} forward pass. This pass computes and caches the attention Key-Value pairs for all context and query blocks. The \textbf{action expert} then performs an iterative denoising process for $a$ steps to generate the final action chunk $\textbf{A}_t$. Each of these $a$ steps re-uses the pre-computed KV cache and only requires a forward pass through the much smaller action expert layers~\cite{black2410pi0}.
+%
+% At inference time, all context tokens—text, images, history track tokens, and 3D queries—are processed by the LLM transformer in a single forward pass, which computes and caches the attention Key–Value pairs for subsequent use. The \textbf{action expert} then performs its iterative denoising procedure for $a$ steps to produce the final action chunk  $\textbf{A}_t$, reusing the cached Key–Value states and invoking only the lightweight action-specific layers.
+At inference time, all context tokens including text, images, history track tokens and 3D queries are processed by the transformer in a single forward pass, which computes and caches attention Key--Value pairs for subsequent use. The \emph{action expert} then performs its iterative denoising process for $a$ steps to generate the action chunk $\mathbf{A}_t$, reusing the cached Key--Value states and invoking only its lightweight action-specific layers.
+
+Importantly, the predictive 3D Gaussian geometry modules (e.g., the voxel decoder and depth-rendering module) are not executed during inference. They serve purely as training-time supervision signals that shape the transformer's internal representations with geometric and physical structure, while the action-generation pathway remains unchanged and efficient during deployment.
+
+
+% Notably, the computationally expensive components for 3D world modeling, such as the Voxel Decoder and the Future Depth Rendering module, are \textbf{not} executed during inference. Their sole purpose during training is to provide a rich and predictive 3D representation on which to condition the action expert, thereby instilling the policy with geometric and physical awareness. This decouples the high-frequency action generation from the complex and non-real-time 3D prediction tasks.
+% Crucially, the predictive 3D world-modeling components (e.g., the voxel decoder and depth-rendering module) are not executed during inference. They serve exclusively as training-time supervision mechanisms, shaping the transformer's internal representations with geometric and physical structure while leaving the action-generation phase unchanged and efficient.

@@ -1,0 +1,12 @@
+\section{Conclusion}
+\label{sec:conclusion}
+% We presented \textbf{GeoPredict}, a geometry-aware VLA framework that augments a continuous-action policy with predictive kinematic and geometric priors. By jointly learning future robot keypoint trajectories and future workspace geometry via a predictive 3D Gaussian Splatting model with track-guided refinement, GeoPredict provides the transformer with future-aware structure while keeping inference lightweight. Extensive experiments on simulation and real-world manipulation tasks show that GeoPredict consistently improves over strong VLA baselines, particularly in settings that demand precise 3D reasoning, geometric robustness, and long-horizon physical consistency. We believe this training-time predictive supervision offers a promising direction for building more reliable and geometry-aware VLA controllers.
+
+We presented \textbf{GeoPredict}, a geometry-aware VLA framework enhancing continuous-action policies with predictive kinematic and geometric priors. By forecasting robot trajectories and workspace geometry via track-guided 3DGS, GeoPredict introduces future-aware structure into the transformer while keeping inference lightweight. Extensive experiments show consistent superiority over strong baselines in tasks requiring precise 3D reasoning, geometric robustness and long-horizon physical consistency. While acquiring multi-view RGB-D and camera extrinsics presents scaling challenges, the increasing availability of calibrated depth in modern datasets and commodity hardware mitigates these concerns. Ultimately, our training-time predictive supervision provides a promising direction for reliable, geometry-aware, and grounded VLA controllers.
+
+
+
+\section*{Acknowledgment}
+{\sloppy
+This work is supported by the Shenzhen Science and Technology Program (Grant No. ZDCY20250901113000001) and the 1+1+1 CUHK-CUHK(SZ)-GDSTC Joint Collaboration Fund (Grant No. 2025A0505000079). We gratefully acknowledge DISCOVER Robotics for providing hardware support.
+\par}

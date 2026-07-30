@@ -1,0 +1,79 @@
+% CVPR 2026 Paper Template; see https://github.com/cvpr-org/author-kit
+
+\documentclass[10pt,twocolumn,letterpaper]{article}
+
+%%%%%%%%% PAPER TYPE  - PLEASE UPDATE FOR FINAL VERSION
+% \usepackage{cvpr}              % To produce the CAMERA-READY version
+% \usepackage[review]{cvpr}      % To produce the REVIEW version
+\usepackage[pagenumbers]{cvpr} % To force page numbers, e.g. for an arXiv version
+
+\usepackage[accsupp]{axessibility}  % Improves PDF readability for those with disabilities.
+
+% Import additional packages in the preamble file, before hyperref
+\input{preamble}
+
+% It is strongly recommended to use hyperref, especially for the review version.
+% hyperref with option pagebackref eases the reviewers' job.
+% Please disable hyperref *only* if you encounter grave issues, 
+% e.g. with the file validation for the camera-ready version.
+%
+% If you comment hyperref and then uncomment it, you should delete *.aux before re-running LaTeX.
+% (Or just hit 'q' on the first LaTeX run, let it finish, and you should be clear).
+\definecolor{cvprblue}{rgb}{0.21,0.49,0.74}
+\usepackage[pagebackref,breaklinks,colorlinks,allcolors=cvprblue]{hyperref}
+
+\newcommand\sss[1]{\textcolor{purple}{[\textbf{ss}: #1]}}
+
+%%%%%%%%% PAPER ID  - PLEASE UPDATE
+\def\paperID{} % *** Enter the Paper ID here
+\def\confName{CVPR}
+\def\confYear{2026}
+
+%%%%%%%%% TITLE - PLEASE UPDATE
+% \title{GeoPredict: A Vision-Language-Action Framework with \underline{Predict}ive Kinematic and \underline{Geo}metric Priors}
+% \title{GeoPredict: Predictive Kinematic and 3D Geometric Priors for Vision–Language–Action Manipulation}
+\title{GeoPredict: Leveraging Predictive Kinematics and 3D Gaussian Geometry for Precise VLA Manipulation}
+
+%%%%%%%%% AUTHORS - PLEASE UPDATE
+\author{
+    Jingjing Qian$^{1}$ \quad
+    Boyao Han$^{2}$ \quad
+    Chen Shi$^{1}$ \quad
+    Lei Xiao$^{1}$ \quad
+    Long Yang$^{1}$ \quad
+    Shaoshuai Shi$^{3}$ \quad
+    Li Jiang$^{1\dagger}$ \\
+    $^{1}$The Chinese University of Hong Kong, Shenzhen \\
+    $^{2}$Hunan University \quad
+    $^{3}$Voyager Research, Didi Chuxing \\[5pt]
+    {\tt\small \url{https://jingjingqian75.github.io/GeoPredict-Page/}}
+}
+
+
+
+
+
+
+
+\begin{document}
+\maketitle
+{
+    \renewcommand{\thefootnote}{$\dagger$}
+    \footnotetext{Corresponding Author.}
+}
+\input{sec/0_abstract}    
+\input{sec/1_intro}
+\input{sec/2_related_work}
+\input{sec/3_method}
+\input{sec/4_experiments}
+\input{sec/5_conclusion}
+{
+    \small
+    \bibliographystyle{ieeenat_fullname}
+    \bibliography{main}
+}
+
+% WARNING: do not forget to delete the supplementary pages from your submission 
+% \input{sec/X_suppl}
+
+\end{document}
