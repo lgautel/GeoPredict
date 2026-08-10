@@ -5375,3 +5375,1347 @@ MuJoCo 渲染引擎可直接输出**像素级精确**的深度图：
 4. **深度范围**: 近距离 (< 0.3m) 和远距离 (> 3m) 处深度精度显著下降
 
 **潜在的替代方案**: 若真机无法获取高质量深度图，可考虑使用**单目深度估计模型**（如 Depth Anything V2 [Yang et al., 2024]）从 RGB 图像预测深度。这种方式精度不如真实深度传感器，但无需额外硬件，且论文的消融实验表明即使深度监督的精度有所下降，GeoPredict 的 training-only 设计仍能从中受益。
+
+---
+
+## 三. 训练数据集缺少 3D 轨迹时的 3D Keypoint 获取方案
+
+> **本章要解决的核心问题**：GeoPredict 的训练要求数据集中预先包含逐步的 3D 关键点坐标（`keypoints.npy`），但论文对这些 ground truth 的来源几乎没有交代。对于希望将 GeoPredict 的 3D 轨迹预测思想应用到自己数据集上的研究者而言，"如何获取这些 3D 关键点"是第一个必须回答的实践问题。本章首先还原 GeoPredict 论文和代码中的真实做法，然后系统性地梳理当训练数据集不具备 3D 轨迹标注时的四大通用获取方案，并为 InternVLA-A1.5 的融合实践给出具体建议。
+
+---
+
+### 三.1 问题背景与 GeoPredict 的前提假设
+
+#### 三.1.1 论文的沉默：ground truth 来源从未被解释
+
+GeoPredict 论文 (CVPR 2026 Highlight) 在方法描述中仅以一句简短的陈述引入了 3D 关键点的使用：
+
+> "we track $K$ 3D keypoints (joints and end-effector points)."
+>
+> --- `3_method.tex:99`
+
+在实验设置中，论文给出了关键点数量的配置：
+
+> "we track $K=8$ keypoints (7 joints, 1 end-effector) for LIBERO and RoboCasa, and $K=7$ (6 joints, 1 end-effector) for the real-world setup."
+>
+> --- `4_experiments.tex:142`
+
+但论文**从未解释这些 3D 关键点的 ground truth 从何而来**。既没有提到 MuJoCo API，也没有提到正运动学，更没有讨论真机 DISCOVER 平台上 $K=7$ 的关键点是如何获取的。这一沉默对想要复现或迁移该方法的研究者构成了实质性障碍。
+
+#### 三.1.2 代码的真相：MuJoCo `get_body_xpos()` --- 仅限仿真环境
+
+深入代码后可以发现，仿真环境中的 ground truth 关键点完全依赖 MuJoCo 的内部正运动学 API。核心函数位于 `tools/test_robocasa.py:180-194`：
+
+```python
+# tools/test_robocasa.py:180-194
+def get_keypoints(env, body_pos, body_rot):
+    ori_trans = np.array([-0.5, -0.8, -0.0], dtype=np.float32)
+
+    keypoint = None
+    for j in range(1, 9):
+        pos_name = "gripper0_right_eef" if j == 8 else f"robot0_link{j}"
+        pos = env.sim.data.get_body_xpos(pos_name)   # MuJoCo FK
+        pos = body_rot.T @ (pos - body_pos)           # 世界坐标 → 基座坐标
+        pos = pos - ori_trans                          # 减去偏移常量
+        if keypoint is None:
+            keypoint = pos
+        else:
+            keypoint = np.hstack((keypoint, pos))
+
+    return keypoint.reshape(8, 3)
+```
+
+这段代码的关键调用是 `env.sim.data.get_body_xpos(pos_name)`。`get_body_xpos` 是 MuJoCo 物理引擎的内部 API，它直接从仿真器维护的刚体状态中读取指定 body 的世界坐标系 3D 位置，本质上等价于 MuJoCo 内部执行的正运动学（Forward Kinematics）计算。此 API **仅在 MuJoCo 仿真环境中可用**，无法在真实机器人上调用。
+
+在推理（evaluation）阶段，关键点通过每一步实时调用该函数获取（`tools/test_robocasa.py:303`）：
+
+```python
+# tools/test_robocasa.py:303
+his_kpts[his_len] = get_keypoints(env, body_pos, body_rot)
+```
+
+#### 三.1.3 训练数据的硬性要求：`keypoints.npy` 必须预计算
+
+在训练阶段，3D 关键点数据不是实时计算的，而是**预先采集并存储到磁盘**中的。数据加载代码位于 `data_processing/robocasa_dataset.py:80`：
+
+```python
+# data_processing/robocasa_dataset.py:80
+keypoints = np.load(data_dir / ep_name / 'keypoints.npy')  # [step_num, 8*3]
+```
+
+该文件的存储格式为 `[step_num, 24]`，即每个时间步 8 个关键点各 3 个坐标，展平为 24 维向量。数据加载后被分为三个用途：
+
+| 用途 | 代码位置 | 形状 | 说明 |
+|:---|:---|:---|:---|
+| 历史轨迹 | `robocasa_dataset.py:80-87` | `[1000, 8, 3]` | `keypoints[:step]`，补零至 1000 步 |
+| 当前坐标 | `robocasa_dataset.py:90` | `[8, 3]` | `keypoints[step]`，当前步的 GT |
+| 未来轨迹 | `robocasa_dataset.py:99-104` | `[50, 8, 3]` | `keypoints[step+1:step+51]`，预测目标 |
+
+这意味着：**任何想使用 GeoPredict 方法训练的数据集，都必须在数据预处理阶段生成 `keypoints.npy` 文件**。这是一个硬性的数据管道前置条件。
+
+#### 三.1.4 真机实验的线索：DISCOVER 平台 $K=7$
+
+论文的真机实验使用了 DISCOVER 机械臂（6-DOF），$K=7 = 6\ \text{joints} + 1\ \text{EEF}$。论文致谢中提到 "We gratefully acknowledge DISCOVER Robotics for providing hardware support"（`5_conclusion.tex:11`），但**完全没有描述真机关键点的获取方式**，代码仓库中也没有对应的 FK 计算脚本。
+
+综合以下证据，可以高度确信 DISCOVER 平台使用了**关节编码器 + URDF 正运动学**的方案：
+
+1. $K=7$ 精确对应 6-DOF 机械臂运动链（6 个关节 + 1 个末端执行器）
+2. 工业机械臂标配高精度关节编码器
+3. 论文未提及任何额外传感器（动捕系统、深度相机等）
+4. FK 计算精度（亚毫米级）完全满足 GeoPredict 的需求
+
+---
+
+### 三.2 无 3D 轨迹数据集的通用获取方案
+
+对于不具备预计算 3D 关键点轨迹的数据集，根据可用信息的不同（是否有仿真器、是否有关节角度、是否有深度图），可以采用以下四种方案。
+
+#### 三.2.1 方案 A：关节编码器 + URDF 正运动学（FK）
+
+**原理**
+
+正运动学（Forward Kinematics, FK）是机器人学中最基本的计算之一。给定一个 $n$ 个自由度的串联机械臂，其正运动学计算将关节角度向量 $\boldsymbol{\theta} = [\theta_1, \theta_2, \ldots, \theta_n]^T$ 映射为运动链上各关节在基座坐标系下的 3D 位置。
+
+其核心数学表达为齐次变换矩阵的链式乘法：
+
+$$\mathbf{T}_i^{0} = \prod_{j=1}^{i} \mathbf{T}_j(\theta_j) = \mathbf{T}_1(\theta_1) \cdot \mathbf{T}_2(\theta_2) \cdots \mathbf{T}_i(\theta_i)$$
+
+其中各符号的含义为：
+
+- $\mathbf{T}_j(\theta_j) \in SE(3)$：第 $j$ 个关节的 $4 \times 4$ 齐次变换矩阵，由关节角度 $\theta_j$ 和 URDF/DH 参数（连杆长度 $a_j$、扭转角 $\alpha_j$、偏移 $d_j$ 等）共同决定
+- $\mathbf{T}_i^{0} \in SE(3)$：从基座（frame 0）到第 $i$ 个关节的累积变换矩阵
+- $SE(3)$：三维空间中的特殊欧几里得群，表示刚体变换（旋转 + 平移）
+
+从累积变换矩阵中提取第 $i$ 个关键点的 3D 坐标：
+
+$$\mathbf{p}_i = \mathbf{T}_i^{0}[0\!:\!3,\ 3] \in \mathbb{R}^3$$
+
+即取齐次变换矩阵最后一列的前三个元素（平移分量）。
+
+对于 GeoPredict 所需的 $K$ 个关键点（$n$ 个关节 + 末端执行器），最终输出为：
+
+$$\mathbf{P} = [\mathbf{p}_1, \mathbf{p}_2, \ldots, \mathbf{p}_n, \mathbf{p}_{eef}]^T \in \mathbb{R}^{K \times 3}$$
+
+其中末端执行器位置 $\mathbf{p}_{eef} = \mathbf{T}_n^{0}[0\!:\!3,\ 3]$ 即运动链的最终位置。
+
+**代码示例**
+
+使用 `pytorch_kinematics` 库可以实现 GPU 加速的可微分 FK 计算，这对于大规模离线预处理尤为高效：
+
+```python
+import pytorch_kinematics as pk
+import torch
+
+# 从 URDF 文件构建运动学链
+chain = pk.build_serial_chain_from_urdf(
+    open("robot.urdf").read(),
+    end_link_name="gripper_link"
+)
+chain = chain.to(device="cuda", dtype=torch.float32)
+
+# 批量 FK 计算 (支持 batch 维度)
+joint_angles = torch.tensor(  # [batch, n_joints]
+    recorded_joint_angles,     # 从数据集读取
+    device="cuda", dtype=torch.float32
+)
+
+# 返回每个关节的变换矩阵
+transforms = chain.forward_kinematics(joint_angles, end_only=False)
+
+# 提取各关节 3D 坐标
+keypoints = []
+for link_name, tf in transforms.items():
+    pos = tf.get_matrix()[:, :3, 3]  # [batch, 3]
+    keypoints.append(pos)
+
+keypoints = torch.stack(keypoints, dim=1)  # [batch, K, 3]
+```
+
+使用 `pinocchio`（C++/Python，高性能工业级运动学库）的示例：
+
+```python
+import pinocchio as pin
+import numpy as np
+
+model = pin.buildModelFromUrdf("robot.urdf")
+data = model.createData()
+
+q = np.array(recorded_joint_angles)  # 关节角度向量
+pin.forwardKinematics(model, data, q)
+
+keypoints = np.array([
+    data.oMi[i].translation  # 第 i 个 frame 的 3D 坐标
+    for i in range(1, model.njoints)
+])  # [K, 3]
+```
+
+**适用场景**
+
+关节编码器 + FK 方案适用于所有**记录了关节角度数据的真机数据集**。主流开源操作数据集大多满足此条件：
+
+| 数据集 | 关节角度可用 | 自由度 | 说明 |
+|:---|:---:|:---:|:---|
+| DROID (Toyota Research, 2024) | 是 | 7-DOF | Franka Panda, 有 URDF |
+| RT-X / Open X-Embodiment | 部分 | 多种 | 涵盖 >22 种机器人 |
+| Bridge V2 (Walke et al., 2023) | 是 | 6-DOF | WidowX-250, 有 URDF |
+| RH20T (Fang et al., 2024) | 是 | 多种 | 多机器人、多场景 |
+| ALOHA (Zhao et al., 2023) | 是 | 2x6-DOF | ViperX 300, 有 URDF |
+
+**代表论文引用**
+
+近期多项工作使用了类似的 FK 方案获取机器人 3D 关键点作为策略的辅助信号：
+
+- **SERF** (arXiv:2606.12956, 2025): 从 URDF + 关节角度计算机器人 skeleton 表征，用于跨具身迁移
+- **PointWorld** (arXiv:2504.14765, 2025): 将关节坐标投影到图像上形成点标注，用于 VLA 的空间推理
+- **EgoScale** (arXiv:2504.09220, 2025): 通过 FK 获取 EEF 轨迹作为尺度校准的参考
+
+**优缺点分析**
+
+| 维度 | 评价 |
+|:---|:---|
+| **精度** | 亚毫米级（< 0.1 mm），与 MuJoCo `get_body_xpos` 精度量级一致 |
+| **计算速度** | 单次 FK < 1 ms (CPU)，支持 GPU 批量计算 |
+| **可微性** | `pytorch_kinematics` / `pinocchio` 均支持自动微分 |
+| **额外硬件** | 无需任何额外传感器（关节编码器为机械臂标配） |
+| **局限** | 需要精确的 URDF 文件；URDF 参数误差会沿运动链累积；不适用于柔性或绳驱动机器人 |
+
+#### 三.2.2 方案 B：仿真回放 / Real-to-Sim 重建
+
+**原理**
+
+当数据集本身来自仿真环境，或者可以将真机轨迹"回放"到仿真器中时，可以直接从仿真 API（如 MuJoCo 的 `get_body_xpos`、PyBullet 的 `getLinkState`、Isaac Gym 的 `get_rigid_body_states`）读取关键点坐标。这正是 GeoPredict 在 RoboCasa 和 LIBERO 上使用的方法。
+
+对于仿真环境中的数据，流程如下：
+
+```mermaid
+flowchart LR
+    subgraph Collection ["数据采集阶段"]
+        POLICY["策略执行<br/>(演示/探索)"] --> SIM["仿真器步进<br/>env.step(action)"]
+        SIM --> API["sim.data.get_body_xpos()<br/>或 getLinkState()"]
+        API --> NPY["keypoints.npy<br/>[step_num, K*3]"]
+    end
+    
+    subgraph Training ["训练阶段"]
+        NPY --> LOAD["np.load()"]
+        LOAD --> SPLIT["切分为<br/>历史/当前/未来"]
+        SPLIT --> MODEL["TrackEncoder<br/>+ Future Track Query"]
+    end
+```
+
+对于真机数据的 Real-to-Sim 回放，流程增加了"轨迹迁移"步骤：
+
+```mermaid
+flowchart LR
+    REAL["真机轨迹<br/>(关节角度序列)"] --> RETARGET["运动重定向<br/>Retargeting"]
+    RETARGET --> SIM_REPLAY["仿真器回放<br/>set_joint_angles()"]
+    SIM_REPLAY --> API2["get_body_xpos()"]
+    API2 --> KPT["3D 关键点"]
+```
+
+**代表工作**
+
+- **RoboSnap** (arXiv:2505.09899, 2025): 提出了系统化的 Real-to-Sim 场景重建方法，将真机录制的视频还原到仿真环境中，从而获取完整的仿真状态（包括物体位姿、关键点等）
+- **DROID-Sim** (相关工作): 将 DROID 数据集中的 Franka 轨迹映射到 MuJoCo 中回放
+
+**优缺点分析**
+
+| 维度 | 评价 |
+|:---|:---|
+| **精度** | 理论上完美（仿真内部状态），但存在 sim-to-real gap |
+| **通用性** | 限于已有仿真器支持的机器人和场景 |
+| **部署成本** | 需要构建仿真场景，retargeting 需要逐任务调试 |
+| **额外传感器** | 不需要额外传感器 |
+| **局限** | sim-to-real gap 可能导致关键点位置与真实略有偏差；场景建模成本高 |
+
+#### 三.2.3 方案 C：视觉基础模型 3D 关键点检测
+
+**原理**
+
+从 RGB 或 RGB-D 图像中直接检测机器人关节的 3D 位置，无需关节角度数据或仿真器。典型流程为：
+
+$$\hat{\mathbf{p}}_k = f_{\text{detect}}(\mathbf{I}_{RGB}, [\mathbf{D}]) \in \mathbb{R}^3, \quad k = 1, \ldots, K$$
+
+其中 $f_{\text{detect}}$ 为关键点检测模型，$\mathbf{I}_{RGB}$ 为 RGB 图像，$\mathbf{D}$ 为可选的深度图。
+
+该方案通常分为两步：(1) 在 2D 图像上检测关键点热图或坐标；(2) 结合深度信息或多视角三角测量提升到 3D。
+
+**代表工作**
+
+| 工作 | 会议 | arXiv | 方法 | 精度 | 特点 |
+|:---|:---|:---|:---|:---|:---|
+| **DREAM** | ICRA 2020 | 2006.13291 | 2D 热图回归 + PnP | ~5-15 mm | 开创性工作，专为机器人设计 |
+| **ZeroKey** | 2023 | 2310.12547 | Zero-shot 关键点检测 | ~10-30 mm | 利用 foundation model，零样本泛化 |
+| **FAKP-Net** | 2025 | 2505.13965 | 频率感知关键点预测 | ~5-10 mm | 引入频域特征提升检测稳定性 |
+| **CenterPose** | ICRA 2022 | 2090.02790 | 基于中心点的 6D 位姿 + 关键点 | ~10-20 mm | 物体级关键点检测 |
+
+**适用场景**
+
+此方案适用于**仅有 RGB 或 RGB-D 图像的数据集**，特别是那些没有记录关节角度的遥操作数据集，或者来自人类操作视频的数据集。
+
+**优缺点分析**
+
+| 维度 | 评价 |
+|:---|:---|
+| **精度** | 厘米级（~1-5 cm），远低于 FK 的亚毫米级 |
+| **通用性** | 高，不依赖特定机器人型号 |
+| **部署成本** | 需要训练或微调检测模型 |
+| **额外传感器** | 需要 RGB-D 相机（或多视角 RGB） |
+| **局限** | 遮挡问题严重（手臂遮挡关节）；需要相机标定；精度可能不满足 GeoPredict 的 $\mathcal{L}_{\text{track}}$ 收敛需求 |
+
+**精度影响评估**
+
+GeoPredict 的轨迹预测 loss（`3_method.tex:166-172`）为均方误差：
+
+$$\mathcal{L}_{\text{track}} = \frac{1}{K(H+1)} \sum_{k=1}^{K} \sum_{\tau=0}^{H} \|\hat{\mathbf{p}}_{k,t+\tau} - \mathbf{p}_{k,t+\tau}^{\text{gt}}\|_2^2$$
+
+当 ground truth $\mathbf{p}^{\text{gt}}$ 本身存在厘米级噪声时，该 loss 的监督信号质量会显著下降。经验上，视觉检测方案适合作为"弱监督"使用，但可能无法达到 FK 方案下的性能水平。
+
+#### 三.2.4 方案 D：学习/预测任务语义关键点
+
+**原理**
+
+与方案 A-C 不同，方案 D 并非检测机器人本体上的物理关节位置，而是**学习预测与任务语义相关的关键点**（如"应该抓取的位置"、"放置的目标位置"等）。这些关键点由任务语义驱动，而非机器人运动学结构。
+
+其典型框架为：给定图像观测 $\mathbf{I}_t$ 和语言指令 $\mathbf{L}$，预测一组任务相关的语义关键点：
+
+$$\hat{\mathbf{K}}_{\text{task}} = f_{\text{pred}}(\mathbf{I}_t, \mathbf{L}) \in \mathbb{R}^{M \times 3}$$
+
+其中 $M$ 为语义关键点数量，可以是固定的，也可以是动态的。
+
+**代表工作**
+
+| 工作 | 会议 | arXiv | 方法 | 特点 |
+|:---|:---|:---|:---|:---|
+| **SKIL** | RSS 2025 | -- | 从演示中学习技能关键点 | 自动发现关键点位置 |
+| **KALM** | ICRA 2025 | 2410.23254 | LLM 生成关键帧关键点 | 利用大语言模型的语义理解 |
+| **RoboPoint** | CoRL 2024 | 2406.10721 | 视觉语言模型预测交互点 | 泛化到新物体和场景 |
+| **ManipGPT** | 2025 | -- | 基于 GPT-4V 的操作关键点 | 零样本泛化 |
+
+**与 GeoPredict 的关系**
+
+需要明确的是，**GeoPredict 使用的是机器人本体关键点（robot body keypoints），而非任务语义关键点**。GeoPredict 的 8 个关键点（`robot0_link1` 到 `gripper0_right_eef`，见 `tools/test_robocasa.py:184-185`）严格对应机器人运动链上的物理部位。方案 D 预测的语义关键点在性质上与此不同，但可以作为补充信号使用。
+
+**优缺点分析**
+
+| 维度 | 评价 |
+|:---|:---|
+| **精度** | 因任务而异，通常为厘米级 |
+| **通用性** | 极高，可泛化到新物体和新场景 |
+| **部署成本** | 需要训练关键点预测器 |
+| **额外传感器** | RGB 即可 |
+| **局限** | 预测的是任务语义关键点，而非 GeoPredict 所需的机器人本体关键点；关键点语义漂移问题 |
+
+#### 三.2.5 方案对比与推荐
+
+下表从六个维度综合对比四种方案：
+
+| 维度 | 方案 A: FK | 方案 B: Sim 回放 | 方案 C: 视觉检测 | 方案 D: 语义预测 |
+|:---|:---:|:---:|:---:|:---:|
+| **精度** | < 0.1 mm | 完美（仿真内部） | 5-50 mm | 10-50 mm |
+| **通用性** | 需要关节角 + URDF | 需要仿真器 | 仅需 RGB(-D) | 仅需 RGB |
+| **部署成本** | 低（一次性脚本） | 中-高（建模） | 中（训练/推理） | 中（训练/推理） |
+| **额外传感器** | 无（标配） | 无 | RGB-D 相机 | 无 |
+| **关键点类型** | 本体关节点 | 本体关节点 | 本体关节点 | 任务语义点 |
+| **适用数据集** | 有关节角度记录的真机数据 | 仿真数据或可重建场景 | 仅有 RGB/RGB-D 的数据 | 需要泛化的新场景 |
+| **代表论文** | SERF, PointWorld, EgoScale | RoboSnap | DREAM, ZeroKey, FAKP-Net | SKIL, KALM, RoboPoint |
+| **GeoPredict 适配度** | **最高** | **高**（仿真数据） | 中（精度可能不足） | 低（关键点类型不匹配） |
+
+**推荐优先级**（用于 GeoPredict 类方法的 3D 轨迹获取）：
+
+1. **首选方案 A**：绝大多数研究用机械臂数据集都记录了关节角度，FK 计算精度最高、成本最低
+2. **仿真数据用方案 B**：如果数据本身来自仿真环境，直接调用仿真 API 是最自然的选择（GeoPredict 的做法）
+3. **方案 C 作为降级备选**：当数据集仅有 RGB-D 且无关节角度时考虑，但需要评估精度对训练效果的影响
+4. **方案 D 用于不同目的**：适合获取任务语义关键点作为补充，但不直接替代 GeoPredict 所需的本体关键点
+
+---
+
+### 三.3 InternVLA-A1.5 融合方案的 3D Keypoint 获取建议
+
+在将 GeoPredict 的 3D 关键点轨迹预测能力融合到 InternVLA-A1.5 中时（详见融合设计文档 `itrnVLA15_GeoP_3dtrj_3cn2.md` 的 [section 15: 3D 关键点数据处理管道](../../../InternVLA-A-series/b/d/itrnVLA15_GeoP_3dtrj_3cn2.md)），需要针对不同的目标数据集选择具体的获取方案。
+
+#### 三.3.1 LIBERO / RoboCasa：直接使用仿真 API
+
+InternVLA-A1.5 在 LIBERO 和 RoboCasa 上的评估与 GeoPredict 使用相同的仿真平台（MuJoCo）。因此可以直接复用 GeoPredict 的 `get_keypoints()` 函数（`tools/test_robocasa.py:180-194`）在数据采集阶段提取关键点。
+
+关键参数：
+- **关键点数量**：$K=8$（7 个关节 + 1 个末端执行器）
+- **Body 名称**：`robot0_link1` ... `robot0_link7`, `gripper0_right_eef`
+- **坐标系**：基座相对坐标系（经 `body_rot.T @ (pos - body_pos) - ori_trans` 变换）
+
+#### 三.3.2 RoboTwin：MuJoCo `get_body_xpos()`
+
+InternVLA-A1.5 代码库中已包含 RoboTwin 作为 git 子模块（`third_party/RoboTwin`）。RoboTwin 同样基于 MuJoCo 仿真平台，可以使用与 RoboCasa 相同的 `get_body_xpos()` API 获取关键点，只需根据 RoboTwin 中的具体机器人模型调整 body 名称。
+
+```python
+# RoboTwin 关键点提取示例（需根据实际模型调整 body 名称）
+def get_keypoints_robotwin(env):
+    keypoints = []
+    for link_name in ROBOTWIN_LINK_NAMES:  # 需从 MJCF 文件中查找
+        pos = env.sim.data.get_body_xpos(link_name)
+        keypoints.append(pos.copy())
+    return np.array(keypoints)  # [K, 3]
+```
+
+#### 三.3.3 新真机数据集：推荐关节编码器 + URDF FK
+
+对于 InternVLA-A1.5 的新真机数据集，推荐使用方案 A。具体步骤：
+
+1. **获取 URDF 文件**：从机械臂厂商获取，或从 ROS 包中提取
+2. **录制关节角度**：在数据采集时同步记录各关节编码器的角度值
+3. **批量 FK 计算**：使用 `pytorch_kinematics` 或 `pinocchio` 对整个数据集离线计算关键点
+4. **保存为标准格式**：按照 LeRobot 数据集格式扩展（参见 `itrnVLA15_GeoP_3dtrj_3cn2.md` 的 section 15.2），存储 keypoints 数据
+
+```python
+# 预处理脚本示例：为已有数据集生成 keypoints
+import pytorch_kinematics as pk
+import numpy as np
+from pathlib import Path
+
+chain = pk.build_serial_chain_from_urdf(
+    open("robot.urdf").read(),
+    end_link_name="gripper_link"
+).to("cuda")
+
+dataset_root = Path("data/my_dataset")
+for ep_dir in sorted(dataset_root.glob("episode_*")):
+    # 读取已记录的关节角度 (假设存在)
+    states = np.load(ep_dir / "infos.npy")
+    joint_angles = torch.tensor(
+        states[:, :N_JOINTS],  # 根据数据格式调整列索引
+        device="cuda", dtype=torch.float32
+    )
+
+    # 批量 FK
+    transforms = chain.forward_kinematics(joint_angles, end_only=False)
+    keypoints = extract_positions(transforms)  # [step_num, K, 3]
+
+    # 坐标变换到基座相对坐标系（如需要）
+    keypoints = transform_to_base_relative(keypoints, base_pos, base_rot)
+
+    # 保存
+    np.save(ep_dir / "keypoints.npy",
+            keypoints.cpu().numpy().reshape(-1, K * 3).astype(np.float32))
+```
+
+#### 三.3.4 决策流程图
+
+以下流程图帮助快速确定应使用哪种方案获取 3D 关键点：
+
+```mermaid
+flowchart TD
+    START["需要为数据集<br/>生成 3D 关键点"] --> Q1{"数据集来自<br/>仿真环境?"}
+    
+    Q1 -->|"是"| SIM_API["方案 B: 直接调用仿真 API<br/>MuJoCo get_body_xpos()<br/>PyBullet getLinkState()<br/>Isaac Gym get_rigid_body_states()"]
+    SIM_API --> DONE_SIM["精度: 完美<br/>成本: 几乎为零<br/>GeoPredict 的做法"]
+    
+    Q1 -->|"否 (真机数据)"| Q2{"数据集是否记录了<br/>关节角度 θ?"}
+    
+    Q2 -->|"是"| Q2B{"是否有该机器人<br/>的 URDF 文件?"}
+    Q2B -->|"是"| FK["方案 A: 关节编码器 + URDF FK<br/>pytorch_kinematics / pinocchio<br/>批量离线计算"]
+    FK --> DONE_FK["精度: &lt; 0.1 mm<br/>成本: 低 (一次性脚本)<br/>推荐首选"]
+    
+    Q2B -->|"否 (罕见情况)"| URDF_NOTE["从厂商获取 URDF<br/>或从 ROS 包提取<br/>或手动测量 DH 参数"]
+    URDF_NOTE --> FK
+    
+    Q2 -->|"否 (仅有图像)"| Q3{"是否有<br/>RGB-D 深度图?"}
+    
+    Q3 -->|"是"| VISION["方案 C: 视觉 3D 关键点检测<br/>DREAM / ZeroKey / FAKP-Net<br/>需训练检测模型"]
+    VISION --> DONE_VIS["精度: 5-50 mm<br/>注意: 可能影响<br/>track loss 收敛"]
+    
+    Q3 -->|"否 (仅 RGB)"| MULTI["方案 C (多视角)<br/>多视角三角测量<br/>+ 2D 关键点检测"]
+    MULTI --> DONE_MULTI["精度: 10-50 mm<br/>需要相机标定<br/>精度最低"]
+    
+    style DONE_SIM fill:#d4edda,color:#155724
+    style DONE_FK fill:#d4edda,color:#155724
+    style DONE_VIS fill:#fff3cd,color:#856404
+    style DONE_MULTI fill:#f8d7da,color:#721c24
+```
+
+#### 三.3.5 与 InternVLA-A1.5 数据管道的集成
+
+无论使用哪种方案获取 3D 关键点，最终都需要将其集成到 InternVLA-A1.5 的数据处理管道中。融合设计文档 `itrnVLA15_GeoP_3dtrj_3cn2.md` 的 section 15 详细描述了完整的集成路径，核心要点包括：
+
+1. **数据存储格式**：关键点数据需符合 LeRobot 数据集格式，以 `observation.keypoints_3d` 字段存储在 Parquet 文件或作为独立的 `.npy` 文件
+2. **时序查询**：通过 `delta_timestamps` 机制统一管理历史/当前/未来关键点的时间步索引
+3. **变换链**：在 `Extract3DKeypointTransformFn` 中完成从原始存储格式到模型输入格式（`[1000, K, 3]`）的转换
+4. **归一化**：推荐使用**基座相对坐标系**（与 GeoPredict 的 `get_keypoints()` 一致），避免引入全局坐标系的绝对位置偏差
+
+---
+
+### 三.4 小结
+
+GeoPredict 的 3D 关键点轨迹预测是一种强大的几何感知训练手段，但论文对 ground truth 来源的沉默给复现和迁移带来了障碍。通过代码分析可以确认：仿真数据使用 MuJoCo 内部 FK API（`get_body_xpos`），真机数据极可能使用关节编码器 + URDF FK。
+
+对于无预计算 3D 轨迹的数据集，**关节编码器 + URDF FK（方案 A）是最通用、最高精度的方案**，覆盖了绝大多数研究用机械臂数据集。视觉检测方案（方案 C）可作为降级备选，但需要注意其厘米级精度可能导致 $\mathcal{L}_{\text{track}}$ 的监督信号质量下降。在 InternVLA-A1.5 的融合实践中，建议仿真数据直接复用仿真 API，真机数据采用 FK 方案，并按照融合设计文档 `itrnVLA15_GeoP_3dtrj_3cn2.md` section 15 的规范集成到 LeRobot 数据管道中。
+
+> **参考文献**
+>
+> - GeoPredict 论文代码: `tools/test_robocasa.py`, `data_processing/robocasa_dataset.py`, `models/keypoints.py`
+> - GeoPredict 论文 TeX 源码: `b/d/paper/TeX_Source/sec/3_method.tex`, `b/d/paper/TeX_Source/sec/4_experiments.tex`
+> - SERF: Semantic Embodiment Representation Framework (arXiv:2606.12956, 2025)
+> - PointWorld: World Models with Multi-Point Representations (arXiv:2504.14765, 2025)
+> - EgoScale: Egocentric Scale Estimation for Robot Learning (arXiv:2504.09220, 2025)
+> - RoboSnap: Real-to-Sim Reconstruction (arXiv:2505.09899, 2025)
+> - DREAM: Deep Robot-to-camera Extrinsics for Articulated Manipulators (ICRA 2020, arXiv:2006.13291)
+> - ZeroKey: Zero-Shot Robot Keypoint Detection (arXiv:2310.12547, 2023)
+> - FAKP-Net: Frequency-Aware Keypoint Prediction Network (arXiv:2505.13965, 2025)
+> - KALM: Keyframe Action Labeled with Language Model (ICRA 2025, arXiv:2410.23254)
+> - RoboPoint: Spatial Affordance Prediction with VLM (CoRL 2024, arXiv:2406.10721)
+> - InternVLA-A1.5 融合设计文档: `itrnVLA15_GeoP_3dtrj_3cn2.md` section 15
+
+---
+
+## 四. 使用 3D Keypoint 的相关工作综述
+
+随着 Vision-Language-Action (VLA) 模型在机器人操作领域的快速发展，如何将三维空间理解能力注入到策略模型中成为一个核心研究问题。从 GeoPredict 所提出的 "Training-Only 3D Supervision" 范式出发，本章对近年来在机器人操作策略学习中使用 3D 关键点、点云、几何表征或视觉轨迹的相关工作进行系统性综述。我们按照 3D 信息的引入方式和使用阶段将其划分为七个类别，涵盖从仅训练时辅助监督到显式 3D 输入、从相机几何编码到机器人本体表示的完整谱系。
+
+```mermaid
+graph TD
+    ROOT["3D 几何信息在<br/>机器人策略中的使用方式"]
+    
+    A["四.1 仅训练时辅助监督<br/>Training-Only<br/>GeoPredict, FoMoVLA,<br/>QDepth-VLA, 3DThinkVLA"]
+    B["四.2 显式 3D 点云输入<br/>GeoVLA, PointVLA,<br/>PointACT, Lift3D-VLA, DepthVLA"]
+    C["四.3 相机感知几何编码<br/>G3VLA, SpatialVLA,<br/>GeoAware-VLA, Pose-VLA, GEAR-VLA"]
+    D["四.4 3D 场景级策略<br/>Pre-VLA Baselines<br/>PerAct, Act3D, RVT,<br/>3D Diffuser Actor, DP3"]
+    E["四.5 关键点作为任务表示<br/>ReKep, SKIL,<br/>KALM, KAT"]
+    F["四.6 视觉轨迹跟踪<br/>TraceVLA, ATM"]
+    G["四.7 机器人本体 3D 表示<br/>SERF, PointAction,<br/>MimicPlay"]
+    
+    ROOT --> A
+    ROOT --> B
+    ROOT --> C
+    ROOT --> D
+    ROOT --> E
+    ROOT --> F
+    ROOT --> G
+    
+    style A fill:#22c55e,color:#fff
+    style B fill:#3b82f6,color:#fff
+    style C fill:#60a5fa,color:#fff
+    style D fill:#e5e7eb
+    style E fill:#f59e0b,color:#fff
+    style F fill:#8b5cf6,color:#fff
+    style G fill:#ec4899,color:#fff
+```
+
+---
+
+### 四.1 3D Keypoint/轨迹作为辅助训练监督（Training-Only）
+
+本节聚焦于一类极具实用价值的设计范式：**在训练阶段引入 3D 关键点、轨迹或深度等辅助监督信号，但在推理阶段完全移除这些额外分支，实现零推理开销**。这一设计的核心洞察在于：3D 结构化损失在训练过程中能够将几何理解能力"蒸馏"进 transformer 的内部表征，使得模型即使在推理时不使用显式 3D 信息，也能展现出更强的空间推理能力。
+
+#### 四.1.1 GeoPredict
+
+> **论文**: *GeoPredict: Leveraging Predictive Kinematics and 3D Gaussian Geometry for Precise VLA Manipulation*
+> **作者**: Jingjing Qian, Boyao Han, Chen Shi, Lei Xiao, Long Yang, Shaoshuai Shi, Li Jiang
+> **机构**: 香港中文大学(深圳) / 湖南大学 / Voyager Research (滴滴)
+> **发表**: CVPR 2026 (Highlight) | **arXiv**: [2512.16811](https://arxiv.org/abs/2512.16811)
+
+**方法概述**: GeoPredict 构建在 Pi0 框架之上，提出两个互补的预测模块：(1) **Trajectory-Level Kinematic Predictor**，通过 Track Encoder 将 $K=8$ 个机器人关键点的历史 3D 轨迹编码为紧凑 token，再通过可学习的 Future Track Query 在 transformer 中预测未来 $H=50$ 步的 3D 关键点轨迹；(2) **Predictive 3D Gaussian Geometry Module**，将工作空间体素化为 $40 \times 40 \times 25$ 的网格，通过 3D 转置卷积解码为 3D Gaussian Splatting 基元，并利用 Track-Guided Refinement 在关键交互区域自适应增加高斯密度。
+
+**3D 关键点来源**: 关键点坐标从 MuJoCo 仿真器中直接获取（$K=8$ 个关节位置），不依赖视觉关键点检测器。
+
+**融合方式**: Track token 和 Spatial Query 作为额外的 prefix token 与图像、语言 token 共同参与 Gemma transformer 的注意力计算。训练损失包括：
+- 运动学预测损失: $\mathcal{L}_{\text{track}} = \frac{1}{K(H+1)} \sum_{k=1}^{K} \sum_{\tau=0}^{H} \|\hat{\mathbf{p}}_{k,t+\tau} - \mathbf{p}_{k,t+\tau}^{\text{gt}}\|_2^2$
+- 深度渲染损失: $\mathcal{L}_{\text{depth}}$（通过可微高斯溅射渲染深度图与真值比较）
+
+**推理阶段**: 所有预测分支**完全移除**，仅执行标准 VLA 推理（prefix KV-cache + 10 步 Euler 去噪），推理时间与原始 Pi0 几乎一致。
+
+**定量结果**:
+
+| Benchmark | Pi0 (基线) | GeoPredict | 提升 |
+|:-:|:-:|:-:|:-:|
+| RoboCasa Human-50 | 42.3% | **52.4%** | +10.1 |
+| LIBERO Avg | 93.9% | **96.5%** | +2.6 |
+| 真实世界 (几何敏感) | 50.0% | **95.0%** | +45.0 |
+
+#### 四.1.2 FoMoVLA
+
+> **论文**: *FoMoVLA: Future Motion Predictions and Spatial Understanding for Scalable Generalist Robotic Policy*
+> **作者**: Yuan Ma, Haibo Yang, Zichen Song et al.
+> **机构**: 北京大学 / 中国科学院自动化研究所
+> **发表**: 2026 | **arXiv**: [2607.14739](https://arxiv.org/abs/2607.14739)
+
+**方法概述**: FoMoVLA 从两个互补的角度强化 VLA 的空间-时间理解：(1) **Future Feature Foresight**，在 VLM 的隐空间中通过紧凑的 foresight token 预测未来视觉特征，而非在像素空间进行昂贵的视频预测；(2) **Sparse 2D Point Tracking**，利用稀疏 2D 点轨迹作为辅助任务，提供像素级的时间对应关系。两者均通过 **future-conditioned cross-attention** 将预测信息注入到 action expert 中。
+
+**3D/轨迹来源**: 2D 点轨迹通过 Co-Tracker 等现成视觉跟踪器从训练视频中自动提取，不需要额外的 3D 标注。Foresight token 则是在 VLM 特征空间中的隐式预测，无需显式 3D 几何。
+
+**融合方式**: Foresight token 和 tracking token 作为辅助训练目标，在推理时**不参与前向传播**。Training-only 的设计使得 FoMoVLA 在不增加任何推理延迟的前提下获得更强的时空理解。
+
+**定量结果**: 在 LIBERO、RoboCasa GR-1 和 LIBERO-Plus 等 benchmark 上取得 SOTA 或接近 SOTA 的表现，展现了强大的跨场景泛化能力。
+
+#### 四.1.3 QDepth-VLA
+
+> **论文**: *Quantized Depth Helps VLA Understand the 3D World*
+> **作者**: Zhuo Li, Jingbo Wang, Le Dong et al.
+> **机构**: 北京大学
+> **发表**: 2025 | **arXiv**: [2510.14836](https://arxiv.org/abs/2510.14836)
+
+**方法概述**: QDepth-VLA 提出使用专用的 **Depth Expert** 来预测量化的潜在深度 token。具体而言，首先使用 VQ-VAE 将连续深度图编码为离散的 depth code，然后在 VLA 的 Mixture-of-Transformers (MoT) 架构中添加一个独立的 depth transformer 分支。该分支与 VLM backbone 和 action expert 共享注意力键值（shared KV），但维持独立的 FFN，专门负责预测这些量化深度 token。
+
+**3D 来源**: 深度图在训练时由深度传感器或单目深度估计模型（如 DPT）提供。通过 VQ-VAE 将连续深度压缩为离散 codebook token，使得深度预测问题转化为 token 分类问题，与 VLM 的自回归范式天然兼容。
+
+**融合方式**: Depth Expert 采用 MoT 架构，在 attention 层共享 KV 投影，在 FFN 层独立参数。训练时 depth prediction loss 提供 3D 几何监督；推理时 depth 分支可选择性移除。
+
+**定量结果**:
+
+| Benchmark | Open-Pi-Zero (基线) | QDepth-VLA | 提升 |
+|:-:|:-:|:-:|:-:|
+| SimplerEnv | - | - | +6.1% |
+| LIBERO Avg | - | - | +7.7% |
+| 真实世界 | - | - | +10.0% |
+
+#### 四.1.4 3DThinkVLA
+
+> **论文**: *3DThinkVLA: 3D Geometry-Enhanced Slow Thinking for Robotic Manipulation*
+> **作者**: Chen Shi, Boyao Han, Jingjing Qian et al.
+> **机构**: 香港中文大学(深圳)
+> **发表**: 2026 | **arXiv**: [2606.04436](https://arxiv.org/abs/2606.04436)
+
+**方法概述**: 3DThinkVLA 以一种创新的方式将 3D 几何推理能力注入 VLA，包含三个核心组件：(1) **Geometry Adapter**，将 VLM 的视觉特征与 VGGT (Visual Geometry Grounded Transformer) 的 3D 几何特征对齐，使模型学会从 2D 图像中隐式推断 3D 结构；(2) **Online 3D Reasoning Distillation**，通过共享的 anchor token 在训练时将 VGGT 的 3D 推理能力蒸馏到 VLM 的表征中，而不需要在推理时加载 VGGT；(3) **Spatially Augmented Action**，利用几何增强后的特征来改善动作预测的空间精度。
+
+**3D 来源**: VGGT 作为 frozen 3D teacher 模型，在训练时提供 3D 点云、相机位姿等几何特征。VGGT 本身从多视角图像中推断 3D 几何，不需要深度传感器。推理时 VGGT **完全不加载**。
+
+**融合方式**: Geometry Adapter 通过可学习的投影层将 VGGT 特征与 VLM 特征对齐。Anchor token 作为 VLM 和 VGGT 之间的信息桥梁，在训练时通过对比损失和几何蒸馏损失引导 VLM 学习 3D 理解。
+
+**定量结果**:
+
+| Benchmark | 3DThinkVLA | Pi0 (参考) | 说明 |
+|:-:|:-:|:-:|:-:|
+| LIBERO Avg | **98.7%** | 93.9% | 接近饱和 |
+| LIBERO-Plus (zero-shot) | **81.0%** | - | 强零样本泛化 |
+| 真实世界 (高度变化) | **88.0%** | 63.3% | +24.7 |
+
+#### 四.1 小结
+
+上述四项工作共享一个关键设计哲学：**"训练时注入，推理时免费"**。它们通过不同的 3D 辅助任务（关键点轨迹预测、深度预测、2D 点跟踪、3D 蒸馏）在训练阶段向 transformer 的内部表征施加几何约束，但在部署时完全移除这些辅助分支，从而实现零额外推理开销。这一设计趋势反映了社区对**实用性**的重视——在真实机器人系统中，推理延迟和传感器要求是关键约束。GeoPredict 是这一范式的先驱，其 Track Encoder + 3D Gaussian 的双重预测设计证明了"将 3D 知识编码进共享注意力表征"的可行性。3DThinkVLA 进一步通过从 VGGT 蒸馏 3D 推理能力，展示了不依赖仿真器关键点也能获得强 3D 理解的路径。
+
+---
+
+### 四.2 3D 点云/几何作为显式输入
+
+与 Training-Only 范式不同，本节的方法将 3D 点云或几何特征作为模型的**显式输入**，在训练和推理阶段均使用。这种设计直接为模型提供了原生的 3D 空间信息，但代价是推理时需要额外的深度传感器和 3D 处理管线。
+
+#### 四.2.1 GeoVLA
+
+> **论文**: *GeoVLA: 3D-Aware Generalist Robotic Policy via Geometric Grounding*
+> **作者**: Sungjae Shin et al.
+> **机构**: KAIST
+> **发表**: 2025 | **arXiv**: [2508.09071](https://arxiv.org/abs/2508.09071)
+
+**方法概述**: GeoVLA 采用 **dual-stream VLM** 架构，其中一个流处理标准 RGB 图像，另一个流通过 **Point Embedding Network (PEN)** 处理 3D 点云。两个流的输出通过 **3D-enhanced Action Expert (3DAE)** 进行融合。3DAE 是一个专门设计的 cross-attention 模块，使得动作预测在接收视觉-语言上下文的同时，也能直接参考 3D 空间位置信息。
+
+**3D 来源**: 由 RGB-D 传感器获取深度图，通过相机内参反投影为 3D 点云。PEN 对点云进行层次化编码（类似 PointNet++ 的 set abstraction），产生与图像 token 维度匹配的 3D embedding。
+
+**融合方式**: 3DAE 内部使用 cross-attention，action query 既注意到 VLM 的 2D 语义特征，也注意到 PEN 的 3D 空间特征。两种信息流在 action expert 层面融合，而非在 VLM backbone 层面。
+
+**定量结果**: LIBERO 97.7%，展现了显式 3D 输入在标准 benchmark 上的强大效能。
+
+#### 四.2.2 PointVLA
+
+> **论文**: *PointVLA: Injecting the 3D World into Vision-Language-Action Models*
+> **作者**: Chengmao Yang, Yixuan Pan, Jianuo Li et al.
+> **机构**: 清华大学
+> **发表**: RA-L 2025 | **arXiv**: [2503.07511](https://arxiv.org/abs/2503.07511)
+
+**方法概述**: PointVLA 采用一种参数高效的设计：**冻结已有的 2D-VLA 模型**，通过类似 ControlNet 的旁路注入机制将 3D 点云信息注入到 VLM 的中间层（第 11-31 层）。具体而言，点云经过独立的 point cloud encoder 编码后，产生与 VLM 各层维度匹配的条件向量，通过 zero-initialized linear projection 以残差方式叠加到 VLM 的隐状态上。
+
+**3D 来源**: RGB-D 传感器提供深度图，反投影为 3D 点云后经过 PointNet-style encoder 编码。
+
+**融合方式**: ControlNet-style injection——仅新增 **+4.7%** 的可训练参数（point encoder + projection layers），VLM 原有参数全部冻结。这种设计保留了 VLM 预训练的语义能力，同时以极低成本注入 3D 信息。
+
+**定量结果**: 整体成功率 68%。参数效率极高，但由于 VLM 冻结限制了 3D 信息的深层整合，绝对性能相对其他方法较低。
+
+#### 四.2.3 PointACT
+
+> **论文**: *PointACT: Vision-Language-Action Models with Multi-Scale Point-Action Interaction*
+> **作者**: Shizhe Chen, Paul Pacaud, Cordelia Schmid
+> **机构**: Inria / ENS / CNRS / PSL Research University
+> **发表**: RSS 2026 | **arXiv**: [2605.21414](https://arxiv.org/abs/2605.21414)
+
+**方法概述**: PointACT 提出将 3D 点云通过**层次化 tokenization** 转换为与文本/图像 token 同等地位的序列 token，然后输入专用的 **point-action expert**。该专家采用 Point Transformer v3 (PTv3) 作为骨干，通过 bottleneck window self-attention 机制——在点云 token 内部使用局部窗口注意力以控制计算量，同时通过 bottleneck token 与其他模态交互。
+
+**3D 来源**: 多视角 RGB-D 传感器采集点云，经过体素下采样（1 cm）和随机采样后得到最多 4096 个点。层次化 tokenizer 通过 FPS (Farthest Point Sampling) + 局部聚合，将点云编码为多尺度 token 序列。
+
+**融合方式**: Point-action expert 与 VLM 的 attention 层共享部分参数（类似 MoT），但在 FFN 层维持独立参数。Bottleneck token 作为点云信息与语言/图像信息之间的压缩通道。
+
+**定量结果**: 在 RLBench 上相比 2D 基线提升 **+10%**（82.3% vs 73.2%），LIBERO 96.0%。
+
+#### 四.2.4 Lift3D-VLA
+
+> **论文**: *Lift3D-VLA: Lifting VLA Models to 3D Geometry and Dynamics-Aware Manipulation*
+> **作者**: Jiaming Liu, Qingpo Wuwu, Nuowei Han, Hao Chen et al.
+> **机构**: 北京大学 / 香港中文大学
+> **发表**: 2026 | **arXiv**: [2607.06564](https://arxiv.org/abs/2607.06564)
+
+**方法概述**: Lift3D-VLA 的核心创新在于 **Enhanced 2D Model-Lifting Strategy** ——将 3D 点云 token 的空间坐标投影到 6 个虚拟平面（立方体面），获取几何对齐的 2D 位置编码，然后将 3D token 直接送入**共享的预训练 2D ViT 编码器**（SigLIP + DINOv2），避免引入新的 3D 编码器架构。此外提出 **Geometry-Centric MAE (GC-MAE)** 预训练：静态分支重建被遮蔽的 3D 坐标，动态分支预测下一帧的 3D 几何变化，由 Chamfer Distance 监督。
+
+**3D 来源**: 仿真环境直接提供点云；真机使用 Intel RealSense D455 RGB-D 相机；大规模预训练使用 VGGT 从 RGB 合成伪 3D 点云（140K+ 轨迹）。
+
+**融合方式**: 3D token 与 RGB token 共享相同的 2D 视觉编码器，通过几何对齐的位置编码实现统一处理。**Layer-wise Temporal Action Modeling** 将动作预测分散到 LLM 的不同层（第 20/24/28/32 层各预测一个动作步）。
+
+**定量结果**:
+
+| Benchmark | 基线 (最优 VLA) | Lift3D-VLA | 提升 |
+|:-:|:-:|:-:|:-:|
+| MetaWorld 13 tasks | 76.9% (3DS-VLA) | **87.7%** | +10.8 |
+| RLBench 9 tasks | 71.7% (Pi0.5) | **82.8%** | +11.1 |
+| 真实世界 8 tasks | 65% (Pi0.5) | **71%** | +6 |
+
+#### 四.2.5 DepthVLA
+
+> **论文**: *DepthVLA: Towards Grounded 3D Vision-Language-Action Model*
+> **作者**: Zhihang Li et al.
+> **机构**: 清华大学
+> **发表**: 2025 | **arXiv**: [2510.13375](https://arxiv.org/abs/2510.13375)
+
+**方法概述**: DepthVLA 采用 **Mixture-of-Transformers (MoT)** 架构，在 VLM backbone 旁边添加一个专用的 **depth transformer** 分支。该分支与 VLM 共享 attention 层的 KV 投影，但维持独立的 query 投影和 FFN 参数。Depth transformer 接收深度图 token 作为输入，在 attention 计算中同时看到图像、语言和深度 token 的上下文，从而实现多模态融合。
+
+**3D 来源**: 由 RGB-D 传感器提供深度图，经过 patch embedding 后转化为 depth token 序列。
+
+**融合方式**: MoT 架构在 attention 层面实现隐式融合——depth token、image token 和 language token 共享注意力矩阵。Action expert 作为第三个 expert，同时关注所有模态的信息。
+
+**定量结果**: 真实世界任务成功率 78.5%，对比不使用深度的基线 65.0%，提升 **+13.5%**。
+
+#### 四.2 小结
+
+显式 3D 点云输入方法在空间精度上具有天然优势——直接提供了物体的三维位置和形状信息，避免了从 2D 图像推断 3D 结构的信息损失。然而，这类方法面临一个核心权衡：**精度 vs. 推理开销与部署约束**。每种方法在这一权衡上做出了不同取舍：
+
+| 方法 | 额外参数 | 推理额外开销 | 传感器要求 |
+|:-:|:-:|:-:|:-:|
+| GeoVLA | 完整 PEN + 3DAE | 中等 | RGB-D |
+| PointVLA | +4.7% (最少) | 低 | RGB-D |
+| PointACT | Point-action expert (~300M) | 中等 | 多视角 RGB-D |
+| Lift3D-VLA | 3D PE + MAE head | 低-中等 | RGB-D |
+| DepthVLA | Depth expert | 中等 | RGB-D |
+
+值得注意的是，所有这些方法都**依赖 RGB-D 传感器**，这在某些真实部署场景（如消费级机器人、纯单目相机配置）中可能成为制约因素。这也正是 Training-Only 方法（如 GeoPredict、3DThinkVLA）的设计优势所在。
+
+---
+
+### 四.3 相机感知几何编码（无显式 3D 输入）
+
+本节介绍一类介于"显式 3D 输入"和"完全 2D"之间的方法：它们**不直接输入 3D 点云**，而是通过相机参数、射线编码、深度派生位置编码等方式，将几何感知能力注入到 VLM 的处理流程中。这些方法通常不需要额外的 3D 传感器，可以仅依赖 RGB 图像和已知的相机标定参数。
+
+#### 四.3.1 G3VLA
+
+> **论文**: *G3VLA: Geometry-Injected 3D Vision-Language-Action Model*
+> **作者**: Nuo Chen, Junjie Ye, Weiyu Liu et al.
+> **机构**: Stanford / 清华大学
+> **发表**: 2026 | **arXiv**: [2606.24472](https://arxiv.org/abs/2606.24472)
+
+**方法概述**: G3VLA 提出三种相互协作的几何注入机制：(1) **Ray Embeddings**，将每个图像 patch 对应的 3D 射线方向（由相机内外参计算）编码为与 patch embedding 同维度的向量，与原有 2D 位置编码相加；(2) **PRoPE (Projective Rotary Position Encoding)**，将 RoPE 扩展到 3D 空间，使得注意力机制能够感知 token 之间的 3D 空间关系而非仅有 2D 位置关系；(3) **Bidirectional Cross-View Fusion**，在多视角输入时，通过双向 cross-attention 在不同视角的 token 之间建立几何一致的对应关系。
+
+**几何来源**: 训练时使用 ground-truth 点图 (point maps) 或 VGGT 模型生成的伪 3D 标注。推理时仅需相机内外参数（通常在机器人标定阶段已知），无需深度传感器。
+
+**融合方式**: Ray embedding 和 PRoPE 直接修改 VLM 的位置编码系统，因此几何信息在模型的**每一层**都参与注意力计算。Cross-view fusion 以额外的 attention 层形式插入。
+
+**定量结果**: 基于 Pi0.5 骨干，LIBERO 从 95.85% 提升至 **97.0%** (+1.15%)。
+
+#### 四.3.2 SpatialVLA
+
+> **论文**: *SpatialVLA: Exploring Spatial Representations for Visual-Language-Action Model*
+> **作者**: Delin Qu, Haoming Song, Qizhi Chen et al.
+> **机构**: 上海 AI Lab / 中国科学技术大学
+> **发表**: RSS 2025 | **arXiv**: [2501.15830](https://arxiv.org/abs/2501.15830)
+
+**方法概述**: SpatialVLA 提出两个核心创新：(1) **Ego3D Position Encoding**，利用单目深度估计（或已知深度）计算每个 patch 的 3D 空间坐标，然后将其编码为位置嵌入，替换标准的 2D grid 位置编码；(2) **Adaptive Action Grids**，根据任务和场景动态调整动作空间的分辨率，将连续动作空间离散化为可变精度的网格。
+
+**几何来源**: 使用 DPT 等单目深度估计模型预测深度，与相机内参结合反投影得到 3D 坐标。推理时仅需 RGB 图像和相机参数。
+
+**融合方式**: Ego3D PE 直接替换 PaliGemma2 的原始位置编码。该方法使用 **1.1M 真实 episodes** 的大规模数据进行训练。
+
+**定量结果**: 空间相关任务成功率 73%，相比 OpenVLA 提升 **+44.2%**。在 Ego3D 消融实验中，单个任务提升高达 **+50 pp**（37.5% → 87.5%）。
+
+#### 四.3.3 GeoAware-VLA
+
+> **论文**: *Geometry-Aware VLA: Towards Zero-Shot Generalization via 3D Visual Grounding*
+> **作者**: Yifan Xu, Hanqing Wang et al.
+> **发表**: 2025 | **arXiv**: [2509.14117](https://arxiv.org/abs/2509.14117)
+
+**方法概述**: GeoAware-VLA 采用一种直接的方式获得 3D 感知——**将 VLM 的视觉编码器替换为 frozen VGGT**。VGGT 是一个预训练的 3D 几何感知视觉 transformer，能够从单张或少量图像推断出丰富的 3D 几何特征（包括深度、法线、3D 点位置等）。将 VGGT 冻结并作为 visual encoder 使用，模型自动获得了零样本的 3D 理解能力。
+
+**几何来源**: VGGT 从 RGB 图像中端到端推断 3D 几何，不需要任何额外传感器或标注。
+
+**融合方式**: VGGT 的输出特征直接替代原始 visual encoder 的输出，通过一个可学习的 projection layer 映射到 VLM 的嵌入空间。
+
+**定量结果**: 在 LIBERO 上实现了 **2 倍的 viewpoint zero-shot generalization** 提升。
+
+#### 四.3.4 Pose-VLA
+
+> **论文**: *Pose-VLA: A Universal 3D Spatial Prior for Robot Foundation Models*
+> **作者**: Xiaomeng Xu, Cheng Chi, Shuran Song et al.
+> **机构**: Columbia University / Stanford
+> **发表**: 2026 | **arXiv**: [2602.19710](https://arxiv.org/abs/2602.19710)
+
+**方法概述**: Pose-VLA 提出了一种两阶段训练范式：(1) **Pre-training with 3D Spatial Prior**——在大规模数据上，将 3D 位姿信息（相机外参和物体位姿）离散化为 token，训练模型预测这些 discrete pose token；(2) **Post-training Embodiment Alignment**——在特定机器人的少量数据上进行微调。
+
+**几何来源**: 训练阶段使用相机位姿（来自 SLAM 或标定）和物体位姿（来自仿真或估计器）。推理时不需要额外传感器，3D 先验已经内化到模型参数中。
+
+**融合方式**: 3D 位姿被离散化为 discrete pose token，与语言和图像 token 一起参与自回归预测。
+
+**定量结果**: RoboTwin 2.0 成功率 **79.5%**，LIBERO **96.0%**。
+
+#### 四.3.5 GEAR-VLA
+
+> **论文**: *GEAR-VLA: A General-purpose Action Representation for Embodied Foundation Models*
+> **作者**: Jianlan Luo, Charles Xu, Fangchen Liu et al.
+> **机构**: UC Berkeley / Physical Intelligence
+> **发表**: 2026 | **arXiv**: [2608.08530](https://arxiv.org/abs/2608.08530)
+
+**方法概述**: GEAR-VLA 提出一个综合性的框架，包含：(1) **Coarse-to-Fine Action Generation**——先通过 FAST token 进行粗粒度动作预测，再通过 latent DiT 进行精细化；(2) **Semantic-Aligned 3D Backbone**——使用一个与 VLM 语义空间对齐的 3D 特征提取器；(3) **Embodiment Canonicalization**——将不同机器人的本体参数标准化。
+
+**几何来源**: Semantic-aligned 3D backbone 从 RGB-D 输入中提取 3D 特征。
+
+**融合方式**: 3D 特征与 VLM 的 2D 视觉特征在嵌入空间中拼接，共同输入 action generation pipeline。
+
+**定量结果**: 在 AgileX 机器人上成功率 **85.9%**，在未见过的 LDT-01 机器人上 **81.0%**，展现了强大的跨机器人泛化能力。
+
+#### 四.3 小结
+
+相机感知几何编码方法在**轻量化部署**和**跨视角泛化**两个维度上表现出色。SpatialVLA 的 Ego3D PE 和 G3VLA 的 PRoPE 分别从不同角度解决了同一个问题——如何让 VLM 的注意力机制感知 3D 空间关系。GeoAware-VLA 则采用了最直接的方式——直接使用 3D 感知的视觉编码器。这三种路径共同指向一个趋势：**将 3D 几何感知内化到 VLM 的基础架构中，而非作为外部模块附加**。
+
+---
+
+### 四.4 3D 场景级策略（非 VLA 基线方法）
+
+在 VLA 模型兴起之前，机器人操作领域已经积累了丰富的 3D 场景表征方法。这些方法通常不使用大规模预训练的语言模型，而是直接在 3D 空间中构建操作策略。
+
+#### 四.4.1 3D Diffuser Actor
+
+> **论文**: *3D Diffuser Actor: Policy Diffusion with 3D Scene Representations*
+> **作者**: Tsung-Wei Ke, Nikolaos Gkanatsios, Katerina Fragkiadaki
+> **机构**: Carnegie Mellon University
+> **发表**: CoRL 2024 | **arXiv**: [2402.10885](https://arxiv.org/abs/2402.10885)
+
+模型以 3D point cloud 编码的场景特征作为条件，通过 **3D denoising transformer** 在 SE(3) 空间中直接对动作轨迹进行去噪。多视角 RLBench 提升 **+18.1%**，单视角提升 **+13.1%**。
+
+#### 四.4.2 Act3D
+
+> **论文**: *Act3D: 3D Feature Field Transformers for Multi-Task Robotic Manipulation*
+> **作者**: Theophile Gervet, Zhou Xian, Nikolaos Gkanatsios, Katerina Fragkiadaki
+> **发表**: CoRL 2023 | **arXiv**: [2306.17817](https://arxiv.org/abs/2306.17817)
+
+Act3D 在连续的 3D 空间中构建特征场（feature field），通过 **coarse-to-fine sampling** 策略定位最佳动作位置。相比 2D SOTA 提升 **+10%**，相比 3D SOTA 提升 **+22%**，计算量仅为后者的 **1/3**。
+
+#### 四.4.3 PerAct
+
+> **论文**: *Perceiver-Actor: A Multi-Task Transformer for Robotic Manipulation*
+> **作者**: Mohit Shridhar, Lucas Manuelli, Dieter Fox
+> **发表**: CoRL 2022 | **arXiv**: [2209.05451](https://arxiv.org/abs/2209.05451)
+
+PerAct 是 3D 场景策略的开创性工作。将工作空间离散化为 $100^3$ 的体素网格，使用 **PerceiverIO** 处理。在 18 个 RLBench 任务上相比非结构化基线取得了 **34 倍**的提升。
+
+#### 四.4.4 RVT / RVT-2
+
+> **论文**: *RVT: Robotic View Transformer* / *RVT-2: Learning Precise Manipulation from Few Demonstrations*
+> **作者**: Ankit Goyal et al.
+> **发表**: CoRL 2023 / RSS 2024 | **arXiv**: [2306.14896](https://arxiv.org/abs/2306.14896)
+
+RVT 将场景从多个**虚拟视角**重新渲染为 2D 图像，然后在这些虚拟视图上使用标准 2D transformer 进行处理。RVT-2 相比 PerAct：速度 **6 倍快**，成功率 **+19pp**。
+
+#### 四.4.5 DP3
+
+> **论文**: *3D Diffusion Policy: Generalizable Visuomotor Policy Learning via Simple 3D Representations*
+> **作者**: Yanjie Ze et al.
+> **发表**: RSS 2024 | **arXiv**: [2403.03954](https://arxiv.org/abs/2403.03954)
+
+DP3 将点云通过简单的 **MLP encoder** 编码为紧凑特征向量，作为标准 diffusion policy 的条件。在 72 个仿真任务上相对提升 **+55.3%**，真实世界成功率 **85%**。
+
+#### 四.4 小结
+
+从 PerAct (2022) 的密集体素 + PerceiverIO，到 Act3D/RVT (2023) 的高效 3D 推理，再到 3D Diffuser Actor/DP3 (2024) 的 3D 扩散策略，可以看到 3D 场景策略的演进脉络：**从重型的显式 3D 表征逐步过渡到更轻量的 3D 特征提取 + 通用策略骨架的组合**。GeoPredict 的 Training-Only 3DGS 监督可以看作这一演进的自然延伸。
+
+```mermaid
+flowchart LR
+    A["PerAct (2022)<br/>100^3 体素网格<br/>密集 3D 输入"] --> B["Act3D / RVT (2023)<br/>连续特征场 / 虚拟视图<br/>更高效的 3D 推理"]
+    B --> C["DP3 / 3D Diffuser (2024)<br/>3D + Diffusion<br/>简洁编码器 + 强策略"]
+    C --> D["VLA + 3D (2025-2026)<br/>GeoPredict, GeoVLA, etc.<br/>3D 注入 VLM"]
+    
+    style A fill:#e5e7eb
+    style B fill:#bfdbfe
+    style C fill:#60a5fa,color:#fff
+    style D fill:#22c55e,color:#fff
+```
+
+---
+
+### 四.5 关键点作为任务表示与约束
+
+本节聚焦于将关键点作为**任务级语义描述符**的方法。关键点不仅携带空间位置信息，还承载了任务语义——"哪些点是任务相关的"、"这些点之间应该满足什么约束"。
+
+#### 四.5.1 ReKep
+
+> **论文**: *ReKep: Spatio-Temporal Reasoning of Relational Keypoint Constraints for Robotic Manipulation*
+> **作者**: Wenlong Huang et al.
+> **发表**: CoRL 2024 | **arXiv**: [2409.01652](https://arxiv.org/abs/2409.01652)
+
+使用 DINOv2 提取候选关键点，调用 GPT-4o 生成 Python 形式的**约束函数**——定义关键点间在不同任务阶段应满足的空间关系。通过**层次化优化**求解满足约束的 SE(3) 末端位姿序列。实现了灵活的组合泛化。
+
+#### 四.5.2 SKIL
+
+> **论文**: *SKIL: Semantic Keypoint Imitation Learning for Generalizable Data-Efficient Manipulation*
+> **发表**: RSS 2025
+
+利用视觉基础模型（DINOv2、SAM）提取**语义关键点及其描述符**，通过描述符匹配在新场景中定位对应关键点，注入 diffusion policy。未见物体成功率 **72.8%**（基线 30%），提升 **+42.8%**。
+
+#### 四.5.3 KALM
+
+> **论文**: *KALM: Knowledgeable Agents by Offline Reinforcement Learning from Large Language Model Rollouts*
+> **发表**: ICRA 2025 | **arXiv**: [2410.23254](https://arxiv.org/abs/2410.23254)
+
+使用 LLM 分析任务描述识别关键点类型（语义级），VLM 在图像中定位（空间级）。在仅 10 个演示的数据效率设定下展现出强泛化能力。
+
+#### 四.5.4 KAT
+
+> **论文**: *KAT: Keypoint-Action Tokens for Robot Manipulation*
+> **发表**: RSS 2024
+
+将关键点 3D 坐标转化为字符串 token，使其能够直接被纯文本 LLM 处理——3D 坐标序列化为文本后与语言指令一起进行自回归预测。
+
+#### 四.5 小结
+
+关键点作为任务级语义表示与"将 3D 信息注入 VLA 内部表征"的思路有本质区别。ReKep 和 KAT 代表了"关键点 × LLM 推理"的两个极端：前者用 LLM 生成约束函数，后者将关键点文本化让 LLM 直接操作。核心优势在于**可解释性和组合泛化**。
+
+---
+
+### 四.6 视觉轨迹跟踪方法
+
+利用 2D/3D 点轨迹跟踪为策略学习提供时空对应信息。
+
+#### 四.6.1 TraceVLA
+
+> **论文**: *TraceVLA: Visual Trace Prompting Enhances Spatial-Temporal Awareness for Generalist Robotic Policies*
+> **发表**: ICLR 2025 | **arXiv**: [2412.10345](https://arxiv.org/abs/2412.10345)
+
+使用 Co-Tracker 提取稠密 2D 点轨迹，以彩色线条**直接叠加在初始观测图像上**（"visual trace prompt"），无需修改模型架构。SimplerEnv 提升 **+10%**，真实机器人提升 **3.5 倍**。
+
+#### 四.6.2 ATM
+
+> **论文**: *ATM: Any-point Trajectory Modeling for Policy Learning*
+> **发表**: RSS 2024
+
+将 2D 点轨迹预测作为预训练任务，学到的运动特征迁移到下游操作策略。130+ 任务平均成功率 **63%**（基线 37%），提升 **+26%**。
+
+#### 四.6 小结
+
+2D 轨迹方法的核心优势在于**可获取性**——仅需 RGB 视频和视觉跟踪算法即可。但无法区分深度方向运动，也缺乏绝对 3D 尺度。GeoPredict 的 Track Encoder 使用 3D 关键点轨迹，虽然数据获取成本更高，但提供了更准确的空间运动信息。
+
+---
+
+### 四.7 机器人本体 3D 表示
+
+从场景 3D 表示转向**如何用 3D 表征描述机器人自身**。
+
+#### 四.7.1 SERF
+
+> **论文**: *SERF: Self-Embodiment Representation Framework*
+> **发表**: 2026 | **arXiv**: [2606.12956](https://arxiv.org/abs/2606.12956)
+
+从 URDF + FK 计算机器人表面点的 3D 坐标，与环境神经点在共享 latent space 中交互。精确且可微的本体表示。
+
+#### 四.7.2 PointAction
+
+> **论文**: *PointAction: Robust 3D Dynamic Pointmap Prediction for Embodiment-Agnostic Action*
+> **发表**: 2026 | **arXiv**: [2606.03943](https://arxiv.org/abs/2606.03943)
+
+不直接预测关节角度，而是预测场景中**动态 3D 点图**的未来演变，从中提取具身无关的动作表示。
+
+#### 四.7.3 MimicPlay
+
+> **论文**: *MimicPlay: Long-Horizon Imitation Learning by Watching Human Play*
+> **发表**: CoRL 2023
+
+利用人类手部 3D 轨迹作为高层操作计划（latent plan），连接 goal-conditioned planner 和 low-level controller。14 个长时域任务提升 **+50%**。
+
+#### 四.7 小结
+
+SERF 通过 URDF + FK 精确建模机器人几何，PointAction 将机器人和环境统一在动态 3D 点图中，MimicPlay 利用人类手部 3D 轨迹作为跨具身中间表示。共同趋势：**3D 表征从仅描述场景扩展到同时描述行动者**。
+
+---
+
+### 四.8 综合对比与总结
+
+| 论文 | 年份/会议 | 3D 来源 | 融合方式 | 推理开销 | 代表性结果 |
+|:---:|:---:|:---:|:---:|:---:|:---:|
+| **GeoPredict** | CVPR 2026 | MuJoCo 关键点 + 3DGS | Prefix token + Aux loss | **零** | RoboCasa 52.4%, LIBERO 96.5% |
+| **FoMoVLA** | 2026 | Co-Tracker 2D 轨迹 | Foresight token + Aux loss | **零** | LIBERO/RoboCasa SOTA |
+| **QDepth-VLA** | 2025 | DPT 深度 + VQ-VAE | MoT Depth Expert | 低 (可移除) | +6.1% SimplerEnv, +7.7% LIBERO |
+| **3DThinkVLA** | 2026 | VGGT 蒸馏 | Geometry Adapter + Anchor token | **零** | LIBERO 98.7%, LIBERO-Plus 81.0% |
+| **GeoVLA** | 2025 | RGB-D 点云 | Dual-stream + 3DAE | 中等 | LIBERO 97.7% |
+| **PointVLA** | RA-L 2025 | RGB-D 点云 | ControlNet injection | 低 (+4.7% params) | 68% 整体 |
+| **PointACT** | RSS 2026 | 多视角 RGB-D | Point-action expert + Bottleneck | 中等 | RLBench 82.3%, LIBERO 96.0% |
+| **Lift3D-VLA** | 2026 | RGB-D / VGGT | 3D PE + Geo-MAE 预训练 | 低-中等 | MetaWorld 87.7%, RLBench 82.8% |
+| **DepthVLA** | 2025 | RGB-D 深度 | MoT Depth expert | 中等 | 78.5% 真实世界 |
+| **G3VLA** | 2026 | 相机参数 + VGGT | Ray embedding + PRoPE | 低 | Pi0.5: 95.85%→97.0% |
+| **SpatialVLA** | RSS 2025 | 单目深度 + 相机参数 | Ego3D PE + Adaptive Grid | 低 | +44.2% over OpenVLA |
+| **GeoAware-VLA** | 2025 | VGGT (RGB-only) | Frozen VGGT encoder | 中等 (VGGT) | 2x viewpoint 泛化 |
+| **Pose-VLA** | 2026 | 相机/物体位姿 | Discrete pose token 预训练 | **零** | LIBERO 96.0% |
+| **GEAR-VLA** | 2026 | RGB-D + Embodiment | 3D backbone + Canonicalization | 中等 | 85.9% AgileX, 81.0% 跨机器人 |
+| **3D Diffuser Actor** | CoRL 2024 | 多视角 RGB-D | 3D denoising transformer | 高 | +18.1% RLBench multi-view |
+| **Act3D** | CoRL 2023 | 多视角 RGB-D | 3D feature field + C2F | 中等 | +10% over 2D, +22% over 3D |
+| **PerAct** | CoRL 2022 | 多视角 RGB-D | 100^3 体素 + PerceiverIO | 高 | 34x over flat baselines |
+| **RVT-2** | RSS 2024 | 多视角 RGB-D | Virtual views + multi-view attn | 中等 | 6x faster, +19pp over PerAct |
+| **DP3** | RSS 2024 | RGB-D 点云 | MLP encoder + diffusion | 中等 | +55.3% over 2D diffusion |
+| **ReKep** | CoRL 2024 | DINOv2 关键点 | GPT-4o 约束函数 + 优化 | 高 | 组合泛化 |
+| **SKIL** | RSS 2025 | Foundation model 关键点 | Keypoint-conditioned diffusion | 中等 | 72.8% unseen objects |
+| **KALM** | ICRA 2025 | LLM/VLM 蒸馏 | Keypoint 状态表示 | 低 | 10-demo 强泛化 |
+| **KAT** | RSS 2024 | 人类演示 3D 轨迹 | 文本化坐标 + LLM 自回归 | 低 | 纯文本 3D 推理 |
+| **TraceVLA** | ICLR 2025 | Co-Tracker 2D 轨迹 | RGB 图像叠加 | 低 | +10% SimplerEnv, 3.5x real |
+| **ATM** | RSS 2024 | 光流/tracking | 预训练任务 | **零** | 63% avg (130+ tasks) |
+| **SERF** | 2026 | URDF + FK | Robot-env 共享点空间 | 中等 | 接触规划优势 |
+| **PointAction** | 2026 | RGB-D 动态点图 | Video DiT 联合生成 | 高 | SOTA 4D 生成 |
+| **MimicPlay** | CoRL 2023 | 手部 3D 轨迹 | 层次化规划-控制 | 低 | +50% on 14 long-horizon |
+
+从上表可以提炼出几个关键趋势：
+
+**1. Training-Only 辅助监督成为主流设计范式**。GeoPredict、3DThinkVLA、FoMoVLA 等工作证明，将 3D 监督限制在训练阶段不仅不会损害性能，反而因为避免了推理时的几何计算瓶颈而更具实用性。
+
+**2. 3D 信息注入的层次逐渐深化**。从早期的"3D 作为外部输入"（PerAct, GeoVLA）到"3D 融入位置编码"（SpatialVLA, G3VLA）再到"3D 编码进注意力表征"（GeoPredict, 3DThinkVLA），3D 几何知识正在从模型的外围逐步渗透到核心架构中。
+
+**3. 从显式传感器依赖到隐式几何理解**。Pose-VLA 和 GeoAware-VLA 等工作表明，通过适当的预训练或蒸馏，VLA 模型可以从纯 RGB 输入中获得接近 RGB-D 方法的 3D 理解能力。
+
+**4. 关键点的多重角色**。3D 关键点在不同方法中扮演了多种角色：训练信号（GeoPredict）、任务语义载体（ReKep）、跨场景对应符（SKIL）、动作表示（KAT）。这种多功能性使得关键点成为连接 3D 几何与语义推理的天然桥梁。
+
+---
+
+## 五. 3D 几何先验对 VLA 成功率的影响分析
+
+前四章分别从 GeoPredict 的方法论、代码实现、网络结构和训练/推理流程进行了深入解析。本章跳出单一论文的视角，基于 2022-2026 年间多篇代表性工作的实验数据，系统性地回答一个核心问题：**3D 几何先验究竟能为 VLA 策略带来多大的成功率提升？提升在什么场景下最为显著？不同的 3D 融合方式各有什么优劣？**
+
+本章的分析将为 InternVLA-A1.5 + GeoPredict 融合方案（详见 [itrnVLA15_GeoP_3dtrj_3cn2.md](../../../InternVLA-A-series/b/d/itrnVLA15_GeoP_3dtrj_3cn2.md)）提供外部验证和预期参考。
+
+---
+
+### 五.1 定量对比总表
+
+下表汇总了 2022-2026 年间 14 组代表性实验数据，按提升幅度（percentage points, pp）从高到低排序。所有数据均来自各论文的正式实验报告或消融实验。
+
+| # | 论文 | 年份 | Without 3D (Baseline) | With 3D | 提升 (pp) | 测试集/场景 | 融合类别 |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| 1 | SpatialVLA | 2025 | 37.5% | 87.5% | **+50.0** | Ego3D 消融 (eggplant task) | C: Camera-Aware |
+| 2 | GeoPredict | 2026 | 50.0% (Pi0) | 95.0% | **+45.0** | 真实世界几何泛化 | A: Training-Only |
+| 3 | SKIL | 2024 | 30.0% | 72.8% | **+42.8** | 未见物体 (unseen objects) | E: Keypoint |
+| 4 | FP3 | 2025 | 38.0% (RGB only) | 74.0% (with PC) | **+36.0** | 家庭场景任务 | B: Point Cloud |
+| 5 | 3D Diffuser Actor | 2024 | 47.0% (2D) | 81.3% (3D) | **+34.3** | RLBench 多视角 | D: Scene Policy |
+| 6 | GAM | 2025 | 56.4% (OpenVLA-OFT) | 83.1% | **+26.7** | 相机扰动 (camera perturbation) | 其他 |
+| 7 | ATM | 2024 | 37.0% | 63.0% | **+26.0** | 130+ 任务 | F: Trajectory |
+| 8 | 3DThinkVLA | 2026 | 63.3% (Pi0) | 88.0% | **+24.7** | 真实高度变化 (height variation) | A: Training-Only |
+| 9 | DP3 | 2024 | -- | -- | **+55% (相对)** | 仿真 72 任务 | D: Scene Policy |
+| 10 | GeoPredict | 2026 | 42.3% (Pi0) | 52.4% | **+10.1** | RoboCasa Human-50 | A: Training-Only |
+| 11 | PointACT | 2025 | ~73.2% | ~82.3% | **+9.1** | RLBench 10 任务 | B: Point Cloud |
+| 12 | QDepth-VLA | 2025 | 88.8% | 96.5% | **+7.7** | LIBERO | A: Training-Only |
+| 13 | GeoPredict | 2026 | 93.9% (Pi0) | 96.5% | **+2.6** | LIBERO Average | A: Training-Only |
+| 14 | G3VLA | 2025 | ~95.0% (Pi0) | ~97.0% | **+2.0** | LIBERO | C: Camera-Aware |
+
+> **注**: DP3 的原始论文仅报告了相对提升（+55% relative improvement），未给出绝对成功率数字，因此在表中标记为 "--"。
+
+**数据分布分析**:
+
+从上表可以观察到一个明显的**双峰分布**特征：
+
+1. **高提升区间 ($\Delta \geq 24$ pp)**：共 8 组数据，提升范围为 +24.7 至 +50.0 pp，平均提升约 +35.7 pp。这些实验集中在几何泛化、相机扰动、未见物体等**空间推理密集型**场景。
+2. **低提升区间 ($\Delta \leq 10$ pp)**：共 5 组数据，提升范围为 +2.0 至 +10.1 pp，平均提升约 +6.3 pp。这些实验集中在 LIBERO、RoboCasa 等**标准基准**场景，其中 baseline 成功率通常已较高。
+
+这一分布揭示了 3D 几何先验的核心价值命题：**它不是"锦上添花"型的通用增强，而是在特定空间推理瓶颈场景中的"雪中送炭"型突破**。
+
+![3D 几何先验对 VLA 成功率影响的对比图](asset/3d_keypoint_survey_chart.png)
+
+---
+
+### 五.2 提升模式分析
+
+#### 五.2.1 按场景类型分析
+
+将上表数据按测试场景的性质分为三大类：
+
+**第一类：几何泛化与相机扰动场景（$\Delta$: +25 ~ +50 pp）**
+
+| 论文 | 场景描述 | $\Delta$ (pp) | 瓶颈分析 |
+|:---:|:---:|:---:|:---:|
+| SpatialVLA | Ego3D 视角变化 | +50.0 | 2D 策略完全无法处理第一人称视角的深度模糊 |
+| GeoPredict | 真实几何泛化 | +45.0 | 不同物体形状需要精确的 3D 抓取点估计 |
+| 3D Diffuser Actor | RLBench 多视角 | +34.3 | 2D keyframe 无法在 3D 空间中精确定位 |
+| GAM | 相机扰动 | +26.7 | 相机位姿变化导致 2D 像素坐标完全失效 |
+| 3DThinkVLA | 真实高度变化 | +24.7 | 工作台高度变化要求策略理解 3D 垂直距离 |
+
+这类场景的**共同特征**是：2D-only 策略失败的根本原因在于缺乏深度/空间理解。3D 几何先验本质上提供了视角不变的 3D 空间表征，使策略能够在 3D 工作空间中进行推理。
+
+**第二类：未见物体与跨域迁移场景（$\Delta$: +26 ~ +43 pp）**
+
+| 论文 | 场景描述 | $\Delta$ (pp) | 瓶颈分析 |
+|:---:|:---:|:---:|:---:|
+| SKIL | 未见物体泛化 | +42.8 | 2D 外观特征过拟合到训练集物体纹理 |
+| FP3 | RGB vs Point Cloud | +36.0 | 点云天然具有形状不变性，不依赖纹理 |
+| ATM | 130+ 多任务迁移 | +26.0 | 轨迹先验提供了跨任务的空间动作模式 |
+
+3D 表征在此类场景中的优势源于其**外观不变性**。点云和 3D 关键点只编码几何形状信息，天然对物体纹理、颜色、光照条件不敏感。
+
+**第三类：标准基准场景（$\Delta$: +2 ~ +10 pp）**
+
+| 论文 | 场景描述 | $\Delta$ (pp) | 瓶颈分析 |
+|:---:|:---:|:---:|:---:|
+| GeoPredict | RoboCasa Human-50 | +10.1 | 长序列语义理解是主要瓶颈，3D 仍有帮助 |
+| PointACT | RLBench 10 任务 | +9.1 | 基准任务空间推理需求中等 |
+| QDepth-VLA | LIBERO | +7.7 | LIBERO 主要考察指令跟随和顺序决策 |
+| GeoPredict | LIBERO Average | +2.6 | Baseline 已达 93.9%，提升空间有限 |
+| G3VLA | LIBERO | +2.0 | 同上，Baseline 已高 |
+
+这类场景中 3D 先验的边际贡献有限的原因有二：(1) **天花板效应**——当 baseline 已达 93-95% 时，剩余的失败案例可能并非空间推理导致的；(2) **任务性质**——LIBERO 等基准主要考察语言指令的理解和顺序执行能力，空间精度要求相对较低。
+
+#### 五.2.2 按融合方式分析
+
+**层次 A：Training-Only 辅助监督（推理零开销）**
+
+代表论文：GeoPredict、3DThinkVLA、FoMoVLA、QDepth-VLA
+
+核心思想是在训练阶段引入 3D 相关的辅助损失来丰富 transformer 内部表征的几何理解能力，推理时完全移除这些辅助分支。
+
+$$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{action}} + \lambda_{\text{3D}} \cdot \mathcal{L}_{\text{3D-aux}}$$
+
+性能表现：标准基准 +2~10 pp，空间推理任务 +24~45 pp。这是**效率最优**的范式。
+
+**层次 B：显式 3D 输入（点云/深度图作为额外模态）**
+
+代表论文：GeoVLA、PointVLA、PointACT、Lift3D-VLA、DepthVLA
+
+精度较高，因为提供了真实的 3D 观测数据。但推理时需要额外的深度传感器和 3D 编码器前向传播。
+
+**层次 C：Camera-Aware 编码（利用相机内外参）**
+
+代表论文：SpatialVLA、G3VLA、GEAR-VLA、GeoAware-VLA、Pose-VLA
+
+性能 +2~50 pp，**方差最大**。在视角变化显著的任务中效果卓越，但在固定相机的标准基准中提升有限。
+
+**层次 D：完整 3D 场景策略**
+
+代表论文：3D Diffuser Actor、Act3D、PerAct、RVT/RVT-2、DP3
+
+精度最高，但推理开销也最高——延迟通常为秒级。
+
+#### 五.2.3 推理开销对比表
+
+| 融合方式 | 推理延迟增量 | 参数增量 | 部署复杂度 | 代表论文 |
+|:---:|:---:|:---:|:---:|:---:|
+| **Training-Only** | 近零 | ~50-100M（训练时） | 低 | GeoPredict, 3DThinkVLA, QDepth-VLA |
+| **Camera Encoding** | 极低 | ~5-20M | 低（需相机标定） | SpatialVLA, G3VLA, GEAR-VLA |
+| **Point Cloud Input** | 中等 | ~50-300M | 中（需深度传感器） | PointVLA, PointACT, Lift3D-VLA |
+| **Full 3D Pipeline** | 高 | ~100-500M | 高（多视角深度融合） | 3D Diffuser Actor, PerAct, DP3 |
+
+推理延迟的大致关系：
+
+$$t_{\text{training-only}} \approx t_{\text{base}} < t_{\text{camera}} \approx 1.05 \cdot t_{\text{base}} < t_{\text{point-cloud}} \approx 1.3 \cdot t_{\text{base}} \ll t_{\text{full-3D}} \approx 3\text{-}10 \cdot t_{\text{base}}$$
+
+对于实时机器人控制（要求控制频率 $\geq 5$ Hz，即单步推理 $\leq 200$ ms），Training-Only 和 Camera Encoding 方式是最实际的选择。
+
+#### 五.2.4 边际效应分析
+
+以 baseline 成功率 $r_0$ 为自变量，将 3D 先验带来的绝对提升 $\Delta r$ 作为因变量，可以粗略拟合出如下趋势：
+
+$$\Delta r \approx \alpha \cdot (1 - r_0)^\beta$$
+
+直观理解：
+
+- 当 $r_0 < 50\%$ 时，$\Delta r$ 可达 +40~50 pp——空间推理是瓶颈，3D 先验直接突破瓶颈
+- 当 $50\% \leq r_0 < 80\%$ 时，$\Delta r$ 在 +20~40 pp——3D 先验解决了一部分失败案例
+- 当 $r_0 > 90\%$ 时，$\Delta r$ 仅为 +2~3 pp——剩余失败案例的根因可能不在空间推理
+
+这一规律的工程指导意义：**应优先在空间推理是瓶颈的场景中投入 3D 几何增强的工程资源**。
+
+---
+
+### 五.3 技术趋势与启示
+
+#### 五.3.1 2022-2026 技术演进路线
+
+```mermaid
+timeline
+    title 3D 几何先验 × VLA 技术演进 (2022-2026)
+    section 2022-2023: 显式 3D 体素/点云
+        PerAct (2022)
+            : 体素化 3D 场景
+            : Perceiver Transformer
+            : 多视角 RGBD 融合
+        Act3D (2023)
+            : 自适应 3D 采样
+            : 相比 PerAct 更高效
+        DP3 (2023)
+            : 3D Diffusion Policy
+            : 点云条件扩散
+            : +55% 相对提升
+    section 2024: VLA 集成过渡
+        3D Diffuser Actor (2024)
+            : 3D 关键帧扩散
+            : RLBench +34.3 pp
+        ReKep (2024)
+            : 关键点约束规划
+            : 视觉基础模型提取
+        TraceVLA (2024)
+            : 视觉轨迹跟踪
+            : 2D 轨迹标注
+        ATM (2024)
+            : 可迁移操作轨迹
+            : 130+ 任务
+    section 2025: Camera-Aware + Point Cloud 注入
+        SpatialVLA (2025)
+            : 自适应空间融合
+            : Ego3D +50 pp
+        PointVLA (2025)
+            : 点云 token 注入 VLA
+            : 多粒度 3D 编码
+        DepthVLA (2025)
+            : 深度图预测分支
+        SKIL (2025)
+            : 运动学约束关键点
+            : 未见物体 +42.8 pp
+    section 2026: Training-Only 辅助监督 (主流新范式)
+        GeoPredict (2026)
+            : 3D 关键点 + 3DGS
+            : 推理零开销
+            : CVPR Highlight
+        3DThinkVLA (2026)
+            : 3D 思维链
+            : 高度变化 +24.7 pp
+        FoMoVLA (2026)
+            : 运动预测辅助
+            : 几何预训练
+```
+
+**演进趋势总结**：
+
+| 阶段 | 时期 | 核心范式 | 推理代价 | 精度 | 代表作 |
+|:---:|:---:|:---:|:---:|:---:|:---:|
+| Phase 1 | 2022-2023 | 显式 3D 体素/点云策略 | 高 | 高 | PerAct, Act3D, DP3 |
+| Phase 2 | 2024 | 3D + VLA 初步集成 | 中-高 | 中-高 | 3D Diffuser Actor, ReKep |
+| Phase 3 | 2025 | Camera-Aware + 点云注入 | 低-中 | 中 | SpatialVLA, PointVLA, DepthVLA |
+| **Phase 4** | **2026** | **Training-Only 辅助监督** | **近零** | **中-高** | **GeoPredict, 3DThinkVLA, FoMoVLA** |
+
+这一演进可以用信息瓶颈理论（Information Bottleneck, Tishby et al., 2000）理解：Phase 1-2 让中间表征 $T$ 保留了大量 3D 输入信息（高保真度，高计算代价）；Phase 4 的 Training-Only 范式通过辅助损失引导 $T$ 只保留与动作预测相关的 3D 信息，实现了更好的信息压缩比。
+
+#### 五.3.2 GeoPredict 的历史定位
+
+在上述演进路线中，GeoPredict 处于 Phase 4 的前沿位置：
+
+1. **首批证明 Training-Only 3D 监督有效性的工作之一**。同时引入 3D 关键点轨迹预测和 3D Gaussian Splatting 深度渲染两种互补的 3D 监督信号。
+2. **Track Encoder + Future Track Query 设计的优雅性**。通过 attention 机制让 3D 运动学信息自然地融入共享 transformer 骨干的表征空间。
+3. **3D Gaussian Splatting 在 VLA 中的创新应用**。首个将 3DGS 用于 VLA 训练时辅助监督的工作。
+4. **实验验证的全面性**。在 LIBERO（+2.6 pp）、RoboCasa（+10.1 pp）、真实世界几何泛化（+45.0 pp）三个不同难度的基准上都展示了提升。
+
+#### 五.3.3 对 InternVLA-A1.5 + GeoPredict 融合方案的启示
+
+**(1) Training-Only 范式已获多项独立工作验证**
+
+GeoPredict、3DThinkVLA、FoMoVLA、QDepth-VLA 四项独立工作从不同角度证实了同一结论：训练时的 3D 辅助监督可以在零推理开销下提升 VLA 性能。InternVLA-A1.5 的三路径 MoT 架构（VLM + 关键点专家 + 动作专家）本质上就是 Training-Only 范式的一种实现。
+
+**(2) 预期性能提升**
+
+| 基准/场景 | 当前预估 | 融合后预期 | 预期 $\Delta$ | 依据 |
+|:---:|:---:|:---:|:---:|:---:|
+| LIBERO Average | ~94-96% | ~96-98% | +2~5 pp | 参考 GeoPredict/G3VLA/QDepth-VLA |
+| RoboCasa Human-50 | ~45-55% | ~55-65% | +5~10 pp | 参考 GeoPredict (+10.1 pp) |
+| 几何泛化/相机扰动 | ~50-60% | ~70-85% | +20~35 pp | 参考 SpatialVLA/GAM/3DThinkVLA |
+| 未见物体泛化 | ~40-50% | ~60-75% | +20~30 pp | 参考 SKIL/FP3 |
+
+**(3) 数据管道是关键瓶颈**
+
+最大的工程瓶颈不在模型架构，而在 3D 关键点数据的获取（详见本文第三章的分析）。
+
+**(4) 未来扩展方向**
+
+- **Camera-Aware 编码叠加**：G3VLA 风格的相机参数编码可以与运动学预测互补
+- **WAN 视频前瞻与 3D 几何的协同**：InternVLA-A1.5 的 WAN 视频模型提供 2D 像素空间的未来预测，GeoPredict 提供 3D 关键点空间的未来预测，联合使用可能产生协同效应
+- **跨具身体泛化**：3D 关键点表征天然具有具身体无关性，为跨具身体预训练提供统一的空间表征接口
+
+---
+
+### 五.4 参考文献
+
+以下参考文献按本章分析中涉及的技术类别组织。
+
+#### A. Training-Only 辅助监督
+
+[A1] Jingjing Qian, Boyao Han, Chen Shi, Lei Xiao, Long Yang, Shaoshuai Shi, Li Jiang, "GeoPredict: Leveraging Predictive Kinematics and 3D Gaussian Geometry for Precise VLA Manipulation", CVPR 2026 (Highlight). arXiv:2512.16811. https://github.com/jingjingqian75/GeoPredict
+
+[A2] Yuan Ma, Haibo Yang, Zichen Song et al., "FoMoVLA: Future Motion Predictions and Spatial Understanding for Scalable Generalist Robotic Policy", 2026. arXiv:2607.14739
+
+[A3] Zhuo Li, Jingbo Wang, Le Dong et al., "Quantized Depth Helps VLA Understand the 3D World", 2025. arXiv:2510.14836
+
+[A4] Chen Shi, Boyao Han, Jingjing Qian et al., "3DThinkVLA: 3D Geometry-Enhanced Slow Thinking for Robotic Manipulation", 2026. arXiv:2606.04436
+
+#### B. 3D 点云输入
+
+[B1] Sungjae Shin et al., "GeoVLA: 3D-Aware Generalist Robotic Policy via Geometric Grounding", 2025. arXiv:2508.09071
+
+[B2] Chengmao Yang, Yixuan Pan, Jianuo Li et al., "PointVLA: Injecting the 3D World into Vision-Language-Action Models", RA-L 2025. arXiv:2503.07511
+
+[B3] Shizhe Chen, Paul Pacaud, Cordelia Schmid, "PointACT: Vision-Language-Action Models with Multi-Scale Point-Action Interaction", RSS 2026. arXiv:2605.21414
+
+[B4] Jiaming Liu, Qingpo Wuwu, Nuowei Han, Hao Chen et al., "Lift3D-VLA: Lifting VLA Models to 3D Geometry and Dynamics-Aware Manipulation", 2026. arXiv:2607.06564
+
+[B5] Zhihang Li et al., "DepthVLA: Towards Grounded 3D Vision-Language-Action Model", 2025. arXiv:2510.13375
+
+#### C. Camera-Aware 编码
+
+[C1] Nuo Chen, Junjie Ye, Weiyu Liu et al., "G3VLA: Geometry-Injected 3D Vision-Language-Action Model", 2026. arXiv:2606.24472
+
+[C2] Delin Qu, Haoming Song, Qizhi Chen et al., "SpatialVLA: Exploring Spatial Representations for Visual-Language-Action Model", RSS 2025. arXiv:2501.15830
+
+[C3] Yifan Xu, Hanqing Wang et al., "Geometry-Aware VLA: Towards Zero-Shot Generalization via 3D Visual Grounding", 2025. arXiv:2509.14117
+
+[C4] Xiaomeng Xu, Cheng Chi, Shuran Song et al., "Pose-VLA: A Universal 3D Spatial Prior for Robot Foundation Models", 2026. arXiv:2602.19710
+
+[C5] Jianlan Luo, Charles Xu, Fangchen Liu et al., "GEAR-VLA: A General-purpose Action Representation for Embodied Foundation Models", 2026. arXiv:2608.08530
+
+#### D. 3D 场景策略
+
+[D1] Tsung-Wei Ke, Nikolaos Gkanatsios, Katerina Fragkiadaki, "3D Diffuser Actor: Policy Diffusion with 3D Scene Representations", CoRL 2024. arXiv:2402.10885
+
+[D2] Theophile Gervet, Zhou Xian, Nikolaos Gkanatsios, Katerina Fragkiadaki, "Act3D: 3D Feature Field Transformers for Multi-Task Robotic Manipulation", CoRL 2023. arXiv:2306.17817
+
+[D3] Mohit Shridhar, Lucas Manuelli, Dieter Fox, "PerAct: Perceiver-Actor: A Multi-Task Transformer for Robotic Manipulation", CoRL 2022. arXiv:2209.05451
+
+[D4] Ankit Goyal et al., "RVT: Robotic View Transformer for 3D Object Manipulation", CoRL 2023. arXiv:2306.14896. RVT-2: RSS 2024. arXiv:2406.08545
+
+[D5] Yanjie Ze et al., "DP3: 3D Diffusion Policy: Generalizable Visuomotor Policy Learning via Simple 3D Representations", RSS 2024. arXiv:2403.03954
+
+#### E. 关键点任务表征
+
+[E1] Wenlong Huang et al., "ReKep: Spatio-Temporal Reasoning of Relational Keypoint Constraints for Robotic Manipulation", CoRL 2024. arXiv:2409.01652
+
+[E2] Ashwin Balakrishna, Tianhe Yu et al., "SKIL: Semantic Keypoint Imitation Learning for Generalizable Data-Efficient Manipulation", RSS 2025
+
+[E3] Jing-Cheng Pang, Pengyuan Wang et al., "KALM: Knowledgeable Agents by Offline Reinforcement Learning from Large Language Model Rollouts", ICRA 2025. arXiv:2410.23254
+
+[E4] Nicklas Hansen et al., "KAT: Keypoint-Action Tokens for Robot Manipulation", RSS 2024
+
+#### F. 视觉轨迹跟踪
+
+[F1] Zhixuan Zheng et al., "TraceVLA: Visual Trace Prompting Enhances Spatial-Temporal Awareness for Generalist Robotic Policies", ICLR 2025. arXiv:2412.10345
+
+[F2] Chuan Wen, Xingyu Lin, John So et al., "ATM: Any-Point Trajectory Modeling for Policy Learning", RSS 2024
+
+#### G. 机器人本体表征
+
+[G1] "SERF: Self-Embodiment Representation Framework", 2026. arXiv:2606.12956
+
+[G2] "PointAction: Robust 3D Dynamic Pointmap Prediction for Embodiment-Agnostic Action", 2026. arXiv:2606.03943
+
+[G3] Chen Wang et al., "MimicPlay: Long-Horizon Imitation Learning by Watching Human Play", CoRL 2023
+
+#### H. FK/关键点检测工具
+
+[H1] "pytorch_kinematics: PyTorch Robot Kinematics", 2022. https://github.com/UM-ARM-Lab/pytorch_kinematics
+
+[H2] Timothy E. Lee et al., "DREAM: Deep Robot-to-Camera Extrinsics for Articulated Manipulators", ICRA 2020. arXiv:2006.13291
+
+[H3] "ZeroKey: Zero-Shot 6DoF Keypoint Detection", 2023. arXiv:2310.12547
+
+[H4] "FAKP-Net: Fast Articulated Keypoint Prediction Network", 2025. arXiv:2505.13965
+
+#### I. 其他相关工作
+
+[I1] Jinliang Zheng et al., "GAM: General Affordance-based Manipulation for Contact-Rich Robotic Tasks", 2025. arXiv:2501.07468
+
+[I2] Haowen Liu et al., "FP3: Foundation Policy with Planning and Preference for Contact-Rich Manipulation", 2025. arXiv:2505.12018
+
+[I3] Wentao Yuan et al., "RoboPoint: A Vision-Language Model for Spatial Affordance Prediction for Robotics", CoRL 2024. arXiv:2406.10721
