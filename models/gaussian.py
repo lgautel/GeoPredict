@@ -1,8 +1,14 @@
 import torch
-from diff_gaussian_rasterization import (
-    GaussianRasterizationSettings, 
-    GaussianRasterizer
-)
+try:
+    from diff_gaussian_rasterization import (
+        GaussianRasterizationSettings,
+        GaussianRasterizer,
+    )
+    _HAS_DIFF_GAUSSIAN = True
+except ImportError:
+    GaussianRasterizationSettings = None
+    GaussianRasterizer = None
+    _HAS_DIFF_GAUSSIAN = False
 
 
 def getProjectionMatrixK(K, H, W, znear, zfar, device="cuda"):
@@ -154,6 +160,11 @@ class GaussianRenderer:
         H=None,
         W=None
     ):
+        if not _HAS_DIFF_GAUSSIAN:
+            raise ImportError(
+                "diff_gaussian_rasterization is required for depth rendering. "
+                "Install it or disable depth loss."
+            )
         # at least one of fovx and fovy is not none
         assert fovx is not None or fovy is not None
         if fovx is None:

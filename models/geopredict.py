@@ -95,13 +95,14 @@ def get_3d_sincos_pos_embed(grid_x, grid_y, grid_z, embed_dim=2048):
 
 
 class GeoPredict(nn.Module):
-    def __init__(self, embed_dtype=torch.bfloat16):
+    def __init__(self, embed_dtype=torch.bfloat16, joint_num=8, use_depth_loss=True):
         super().__init__()
         
         self.action_dim = action_dim
         self.action_horizon = action_horizon
         self.max_token_len = max_token_len
         self.embed_dtype = embed_dtype
+        self.use_depth_loss = use_depth_loss
 
         self.llm = Gemma()
         self.img = SigLIP()
@@ -114,7 +115,7 @@ class GeoPredict(nn.Module):
         self.future_pos = get_1d_sincos_pos_embed(2048, torch.arange(50, dtype=torch.float32), base=100).to(self.embed_dtype)
 
         # keypoints
-        self.joint_num, self.embed_dims = 8, 2048
+        self.joint_num, self.embed_dims = joint_num, 2048
         self.keypoint_encoder = TrackEncoder()
         self.keypoint_embedding = nn.Embedding(self.joint_num, self.embed_dims)
         self.keypoint_out_proj = nn.Linear(self.embed_dims, 3)
@@ -131,7 +132,10 @@ class GeoPredict(nn.Module):
         self.rot_act = lambda x: F.normalize(x, dim=-1)
         self.rgb_act = torch.sigmoid
         self.gs_decoder = VoxelDecoder()
-        self.renderer = GaussianRenderer(resolution=[224, 224], znear=0.01, zfar=10.0)
+        self.renderer = (
+            GaussianRenderer(resolution=[224, 224], znear=0.01, zfar=10.0)
+            if use_depth_loss else None
+        )
         self.refine_gs_mlp = nn.Sequential(
             nn.Linear(128, 256),
             nn.Linear(256, 512),
@@ -310,6 +314,9 @@ class GeoPredict(nn.Module):
         future_kpt_loss = torch.square(future_kpt_pred - future_kpt_flat).mean()
         losses += future_kpt_loss
         loss_dict['future_keypoint_loss'] = future_kpt_loss.item()
+
+        if not self.use_depth_loss:
+            return losses, loss_dict, acc_dict
 
         # current depth loss
         B, H, W = depths_t['left_depth'].shape[:3]

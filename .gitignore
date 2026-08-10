@@ -75,3 +75,5 @@ results/
 # Hugging Face cache
 .cache/
 huggingface/
+
+ckpts/
