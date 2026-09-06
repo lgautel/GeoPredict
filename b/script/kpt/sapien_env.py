@@ -84,6 +84,25 @@ class AlohaFKScene:
             positions[i] = link.get_entity_pose().p
         return positions
 
+    def get_link_poses(
+        self, link_names: List[str]
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Get world-frame positions AND quaternions for the specified links."""
+        n = len(link_names)
+        positions = np.zeros((n, 3), dtype=np.float32)
+        quaternions = np.zeros((n, 4), dtype=np.float64)
+        for i, name in enumerate(link_names):
+            link = self._link_cache.get(name)
+            if link is None:
+                link = self.robot.find_link_by_name(name)
+                if link is None:
+                    raise ValueError(f"Link '{name}' not found")
+                self._link_cache[name] = link
+            pose = link.get_entity_pose()
+            positions[i] = pose.p
+            quaternions[i] = pose.q
+        return positions, quaternions
+
     def get_joint_global_pose(self, joint_name: str) -> Tuple[np.ndarray, np.ndarray]:
         joint = self._joint_cache.get(joint_name)
         if joint is None:

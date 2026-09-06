@@ -2107,3 +2107,1117 @@ python b/script/kpt_tst/validate_all.py
    - `envs/robot/robot.py:106-124` — 双臂 URDF 加载 (`left_entity = right_entity = _entity`)
    - `envs/robot/robot.py:168-192` — `init_joints()` 关节初始化
    - `envs/_base_task.py:202-271` — `setup_scene()` SAPIEN 场景初始化
+
+---
+---
+
+# 附录二: SAPIEN 方案(含关键点及其位姿)详细实施设计
+
+> 基于附录一（§10）的 SAPIEN FK 方案，扩展为在提取 14 个关键点 3D 位置的同时，输出每个关键点的姿态四元数（quaternion）。  
+> 本章所有代码变更**严格采用扩展方式**：对已有文件仅新增方法/函数（不修改已有代码的任何一行），核心逻辑以新增文件实现。  
+> 对应已有方案文档: 本文 §10（附录一）；对应已有实施日志: [`3dkptraj_1LOG.md`](3dkptraj_1LOG.md)、[`3dkptraj_1_scnObj_hngMg_LOG.md`](3dkptraj_1_scnObj_hngMg_LOG.md)
+
+---
+
+## 十一. 配置变量与路径总表
+
+在不同服务器或不同任务上实施数据处理时，以下变量可能需要调整。按「跨机器/跨任务变动频率」从高到低排列。工程师在新机器上实施前应先核对此表。
+
+### 11.1 环境与路径变量（跨机器最可能变化）
+
+| 变量 | 含义 | 配置来源 | 当前服务器取值 |
+|:---|:---|:---|:---|
+| **conda env** | SAPIEN 所在 conda 环境名 | shell 手动激活 | `RoboTwin` |
+| **`GEOPREDICT_ROOT`** | GeoPredict 代码库根目录 | 工作目录 (`cd`) | `/home/luogang/SRC/Robot/GeoPredict` |
+| **`ROBOTWIN_ROOT`** | RoboTwin 项目根目录 | `config.py` L7 | `/home/luogang/share/zwy/Projects/RoboTwin` |
+| **`URDF_PATH`** | ALOHA URDF 文件绝对路径 | `config.py` L8 / CLI `--urdf_path` | `{ROBOTWIN_ROOT}/assets/embodiments/aloha-agilex/urdf/arx5_description_isaac.urdf` |
+| **`DATASET_DIR`** | 输入 LeRobot 数据集目录（按任务替换） | `config.py` L10 / CLI `--dataset_dir` | `/home/luogang/share/zwy/Projects/DATA/RoboTwin-Clean/{task}` |
+| **`OUTPUT_DIR`** | 输出 kptsim 目录（按任务替换） | `config.py` L11 / CLI `--output_dir` | `/home/luogang/share/zwy/Projects/DATA/RoboTwin-Clean/{task}_kptsim` |
+
+> **跨任务使用时**：通过 CLI 参数 `--dataset_dir` 和 `--output_dir` 指定即可，无需改 `config.py`。例如从 `stack_bowls_three` 切换到 `hanging_mug`，只需改这两个参数。
+
+### 11.2 模型与算法配置变量（跨机器人型号可能变化）
+
+| 变量 | 含义 | 配置来源 | 默认值 | 来源文件 |
+|:---|:---|:---|:---|:---|
+| `K` | 关键点总数 | `config.py` L16 | `14` | 双臂各 6 links + 1 TCP |
+| `ROBOT_ROOT_POS` | 机器人 footprint 世界坐标 | `config.py` L13 | `[0.0, -0.65, 0.0]` | RoboTwin `task_config/*.yml` |
+| `ROBOT_ROOT_QUAT` | 机器人 footprint 姿态 `[w,x,y,z]` | `config.py` L14 | `[0.707, 0, 0, 0.707]` | 同上，绕 Z 轴 90° |
+| `GRIPPER_BIAS` | TCP 沿变换后局部 X 轴偏移 (m) | `config.py` L45 | `0.12` | `config.yml` |
+| `GLOBAL_TRANS_MATRIX` | EE 坐标约定变换矩阵 | `config.py` L46-48 | $\text{diag}(1, -1, -1)$ | `config.yml` |
+| `DELTA_MATRIX` | 额外旋转（ALOHA 为 $\mathbf{I}_3$） | `config.py` L49 | $\mathbf{I}_3$ | `config.yml` |
+| `GRIPPER_SCALE` | 夹爪归一化 qpos 范围 | `config.py` L51 | `[-0.01, 0.045]` | `config.yml` |
+| `VOXEL_RANGE_MIN` | GeoPredict 体素空间下界 | `config.py` L60 | `[0, 0, 0]` | GeoPredict 模型架构 |
+| `VOXEL_RANGE_MAX` | GeoPredict 体素空间上界 | `config.py` L61 | `[1.6, 1.6, 1.0]` | GeoPredict 模型架构 |
+
+### 11.3 本方案新增配置变量
+
+| 变量 | 含义 | 默认值 | 备注 |
+|:---|:---|:---|:---|
+| `QUAT_DIM` | 四元数维度 | `4` | 固定值，通常无需修改 |
+| `QUAT_CONVENTION` | 四元数分量顺序标记 | `"wxyz"` | SAPIEN / `transforms3d` 标准 |
+| `QUAT_FILENAME` | 每 episode 四元数输出文件名 | `"keypoint_quats.npy"` | 与 `keypoints.npy` 同目录 |
+
+---
+
+## 十二. 目标与动机
+
+### 12.1 为什么需要四元数
+
+附录一的 SAPIEN FK 方案仅输出每个关键点的 3D 位置 $(x, y, z)$，产物 shape 为 `[T, 42]`（`K=14` 个点 $\times$ 3 坐标）。但在以下场景中，仅有位置信息不够：
+
+1. **GeoPredict 消融实验**: 姿态信息可初始化 3D Gaussian 的各向异性协方差，提升深度渲染精度。
+2. **InternVLA-A1.5 辅助 observation**: 将关键点位姿注入策略网络时，姿态信息描述工具朝向（如杯子被抓取时的倾斜角度由夹爪姿态决定）。
+3. **轨迹规划与碰撞检测**: 下游 motion planning 模块需要完整 link 位姿做碰撞检查。
+4. **SE(3) 数据增强**: 对关键点施加位置+旋转的随机扰动时，需要原始姿态作为基准。
+
+### 12.2 四元数的物理含义
+
+对于第 $k$ 个关键点，在时间步 $t$，完整位姿为：
+
+$$\text{pose}_k^t = (\mathbf{p}_k^t,\; \mathbf{q}_k^t) \in \mathbb{R}^3 \times \mathbb{H}_1$$
+
+其中 $\mathbf{p}_k^t = (x, y, z)$ 为位置（附录一已提取），$\mathbf{q}_k^t = (w, x, y, z)$ 为单位四元数（$\|\mathbf{q}\|_2 = 1$），表示该 link/TCP 坐标系相对于世界系的旋转。
+
+各关键点的四元数来源：
+
+| 关键点索引 | 名称 | 四元数来源 | 说明 |
+|:---:|:---|:---|:---|
+| 0–5 | `fl_link1` ~ `fl_link6` | `link.get_entity_pose().q` | link body frame 的世界系姿态 |
+| 6 | `fl_eef_tcp` | $\text{mat2quat}(\mathbf{R}_{\text{ee}} \cdot \mathbf{G} \cdot \mathbf{D})$ | TCP frame 的世界系姿态（见 §10.4.1 推导） |
+| 7–12 | `fr_link1` ~ `fr_link6` | `link.get_entity_pose().q` | 同左臂（右臂 links） |
+| 13 | `fr_eef_tcp` | 同 TCP 计算 | 同左臂 TCP（右臂） |
+
+TCP 四元数的数学推导与 §10.4.1 一致。TCP 旋转矩阵为：
+
+$$\mathbf{R}_{\text{tcp}} = \mathbf{R}_{\text{ee}} \cdot \mathbf{G} \cdot \mathbf{D}$$
+
+其中 $\mathbf{R}_{\text{ee}}$ 为 EE joint 的世界系旋转矩阵（由 `joint.global_pose.q` 转换），$\mathbf{G} = \text{diag}(1, -1, -1)$，$\mathbf{D} = \mathbf{I}_3$。TCP 四元数：
+
+$$\mathbf{q}_{\text{tcp}} = \text{mat2quat}(\mathbf{R}_{\text{tcp}})$$
+
+> **关于坐标偏移与四元数**: 附录一中的坐标偏移 $\mathbf{o}$ 是**纯平移** $\mathbf{p}_{\text{kpt}} = \mathbf{p}_{\text{world}} - \mathbf{o}$。纯平移**不影响旋转**，因此 `keypoint_quats.npy` 中的四元数始终是世界坐标系下的原始旋转，**与偏移量无关**，无需做任何变换。
+
+---
+
+## 十三. 输出格式设计
+
+### 13.1 产物目录结构
+
+```
+{task}_kptsim/                              # 输出目录（与附录一相同）
+├── episode_000000/
+│   ├── keypoints.npy                       # [T, 42]  float32 — 位置（附录一，不变）
+│   └── keypoint_quats.npy                  # [T, 56]  float32 — 四元数（本方案新增）
+├── ...
+├── episode_{N-1:06d}/
+│   ├── keypoints.npy
+│   └── keypoint_quats.npy
+├── keypoints_meta.json                     # 更新：增加四元数字段
+└── vis/
+    ├── keypoints_3d_samples.png            # 附录一原有
+    └── eef_trajectories_ep0.png            # 附录一原有
+```
+
+### 13.2 文件 shape 与 dtype
+
+| 文件 | shape | dtype | 内存布局 | 变更状态 |
+|:---|:---|:---|:---|:---:|
+| `keypoints.npy` | `[T, 42]` | `float32` | `[kp0_x, kp0_y, kp0_z, kp1_x, ..., kp13_z]` | **不变** |
+| `keypoint_quats.npy` | `[T, 56]` | `float32` | `[kp0_w, kp0_x, kp0_y, kp0_z, kp1_w, ..., kp13_z]` | **新增** |
+
+其中 `T` 为该 episode 的帧数，`42 = K × 3 = 14 × 3`，`56 = K × 4 = 14 × 4`。
+
+下游使用时 reshape：
+
+```python
+positions   = np.load("keypoints.npy").reshape(-1, 14, 3)       # [T, K, 3]
+quaternions = np.load("keypoint_quats.npy").reshape(-1, 14, 4)   # [T, K, 4]
+```
+
+### 13.3 keypoints\_meta.json 新增字段
+
+在附录一已有字段的基础上追加：
+
+```json
+{
+  "K": 14,
+  "keypoint_names": ["fl_link1", "...", "fl_eef_tcp", "fr_link1", "...", "fr_eef_tcp"],
+  "coord_offset": ["-0.675", "..."],
+  "world_range_min": ["..."], "world_range_max": ["..."],
+  "transformed_range_min": ["..."], "transformed_range_max": ["..."],
+  "urdf_path": "...", "dataset_dir": "...", "total_episodes": 50,
+
+  "has_quaternions": true,
+  "quat_dim": 4,
+  "quat_convention": "wxyz",
+  "quat_filename": "keypoint_quats.npy",
+  "quat_coord_frame": "world",
+  "quat_note": "Quaternions are NOT affected by coord_offset (pure translation)."
+}
+```
+
+### 13.4 四元数约定
+
+采用 **Hamilton 约定**: $\mathbf{q} = [w, x, y, z]$，标量分量 $w$ 在前。
+
+| 依据 | 约定 |
+|:---|:---|
+| SAPIEN `sapien.Pose.q` | `[w, x, y, z]` |
+| `transforms3d.quaternions` | `[w, x, y, z]` |
+| RoboTwin `robot.py` 中 `quat2mat(ee_pose.q)` | `[w, x, y, z]` |
+
+> **注意**: `scipy.spatial.transform.Rotation` 使用 `[x, y, z, w]` 约定（标量在后）。若下游使用 scipy，需做转换：`q_scipy = np.roll(q_wxyz, -1)`。
+
+---
+
+## 十四. 代码变更总览
+
+### 14.1 变更文件清单
+
+| 文件路径 | 操作 | 变更内容摘要 | 原因 |
+|:---|:---:|:---|:---|
+| `b/script/kpt/config.py` | **扩展** | 末尾追加 3 个常量 | 四元数维度/约定/文件名，避免多处硬编码 |
+| `b/script/kpt/sapien_env.py` | **扩展** | `AlohaFKScene` 类末尾新增 `get_link_poses()` 方法 | 同时返回 link 的位置和四元数 |
+| `b/script/kpt/eef_calculator.py` | **扩展** | 末尾新增 `compute_tcp_pose()` 函数 | 同时返回 TCP 的位置和四元数 |
+| `b/script/kpt/keypoint_pose_extractor.py` | **新增** | `KeypointPoseExtractor` 类（继承 `KeypointExtractor`） | 核心：在提取位置的同时提取四元数 |
+| `b/script/kpt/run_extract_with_pose.py` | **新增** | CLI 入口脚本 | 调用新 extractor 的独立入口 |
+| `b/script/kpt_tst/test_extract_pose.py` | **新增** | 集成测试 | 验证四元数提取的正确性 |
+| `b/script/kpt_tst/validate_all_with_pose.py` | **新增** | 扩展验收脚本 | 验证四元数的格式/单位范数/连续性 |
+
+### 14.2 不变文件确认
+
+以下文件**完全不修改**，已有行为不受影响：
+
+| 文件路径 | 不改原因 |
+|:---|:---|
+| `b/script/kpt/joint_mapper.py` | 14 → 38 维关节映射与四元数无关 |
+| `b/script/kpt/coord_transform.py` | 坐标偏移仅作用于位置；四元数不需偏移 |
+| `b/script/kpt/keypoint_extractor.py` | 原有父类不改，新类通过继承扩展 |
+| `b/script/kpt/run_extract.py` | 原有入口不改，新入口独立 |
+| `b/script/kpt_tst/validate_all.py` | 原有验收不改，新验收脚本复用其函数 |
+| `b/script/kpt_tst/test_sapien_load.py` | 原有测试不改 |
+| `b/script/kpt_tst/test_joint_mapper.py` | 原有测试不改 |
+| `b/script/kpt_tst/test_fk_home.py` | 原有测试不改 |
+| `b/script/kpt_tst/test_eef_tcp.py` | 原有测试不改 |
+| `b/script/kpt_tst/test_extract_single.py` | 原有测试不改 |
+
+### 14.3 依赖关系图
+
+```mermaid
+graph TB
+    subgraph "新增 / 扩展文件"
+        RPP["run_extract_with_pose.py<br/>(新增 — CLI 入口)"]
+        KPE["keypoint_pose_extractor.py<br/>(新增 — 核心)"]
+        VAP["validate_all_with_pose.py<br/>(新增 — 验收)"]
+        TEP["test_extract_pose.py<br/>(新增 — 测试)"]
+    end
+
+    subgraph "已有文件（橙色=扩展, 灰色=不变）"
+        CFG["config.py<br/>+3 常量"]
+        SE["sapien_env.py<br/>+get_link_poses()"]
+        EEF["eef_calculator.py<br/>+compute_tcp_pose()"]
+        KE["keypoint_extractor.py<br/>不变"]
+        JM["joint_mapper.py<br/>不变"]
+        CT["coord_transform.py<br/>不变"]
+        VA["validate_all.py<br/>不变"]
+    end
+
+    RPP --> KPE
+    KPE -->|"继承"| KE
+    KPE --> SE
+    KPE --> EEF
+    KPE --> CFG
+    KE --> SE
+    KE --> JM
+    KE --> EEF
+    KE --> CT
+    SE --> CFG
+    EEF --> CFG
+
+    VAP -->|"复用 validate_all()"| VA
+    VAP --> CFG
+    TEP --> KPE
+
+    style RPP fill:#e6f3ff,stroke:#4a90d9
+    style KPE fill:#e6f3ff,stroke:#4a90d9
+    style VAP fill:#e6f3ff,stroke:#4a90d9
+    style TEP fill:#e6f3ff,stroke:#4a90d9
+    style CFG fill:#fff3e0,stroke:#e6a23c
+    style SE fill:#fff3e0,stroke:#e6a23c
+    style EEF fill:#fff3e0,stroke:#e6a23c
+    style KE fill:#f0f0f0,stroke:#999
+    style JM fill:#f0f0f0,stroke:#999
+    style CT fill:#f0f0f0,stroke:#999
+    style VA fill:#f0f0f0,stroke:#999
+```
+
+---
+
+## 十五. 已有文件扩展详设
+
+> 以下三个文件各新增若干行代码（方法或函数），**不修改、不删除任何已有行**。
+
+### 15.1 `config.py` — 末尾追加 3 个常量
+
+**变更位置**: 文件末尾（当前最后一行是 `VOXEL_CENTER = ...`，L62）。
+
+**追加内容**:
+
+```python
+# ===== Quaternion output config (Appendix 2) =====
+QUAT_DIM = 4
+QUAT_CONVENTION = "wxyz"  # [w, x, y, z] Hamilton convention (SAPIEN / transforms3d)
+QUAT_FILENAME = "keypoint_quats.npy"
+```
+
+**为什么需要这些常量**:
+- `QUAT_DIM`：`keypoint_pose_extractor.py` 在 save 和 reshape 时使用 `K * QUAT_DIM` 代替硬编码的 `K * 4`。
+- `QUAT_CONVENTION`：写入 `keypoints_meta.json` 供下游读取时识别四元数分量顺序。
+- `QUAT_FILENAME`：save 和 validate 时使用，避免在两个文件中分别硬编码文件名。
+
+**为什么放在 `config.py` 而非新文件中**: 所有已有配置常量（`K`、`KEYPOINT_NAMES`、`VOXEL_RANGE_*` 等）均集中在 `config.py`，保持配置归口一致。
+
+### 15.2 `sapien_env.py` — `AlohaFKScene` 新增 `get_link_poses()` 方法
+
+**变更位置**: `AlohaFKScene` 类中，在现有 `get_link_positions()` 方法（L75-85）之后、`get_joint_global_pose()` 方法（L87）之前插入。
+
+**新增方法**:
+
+```python
+    def get_link_poses(
+        self, link_names: List[str]
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Get world-frame positions AND quaternions for the specified links.
+
+        This is the pose-extended variant of get_link_positions().
+        Positions are returned in float32; quaternions in float64 for
+        precision during downstream rotation math (mat2quat etc.).
+
+        Args:
+            link_names: link name list (e.g. LEFT_ARM_LINK_NAMES)
+        Returns:
+            positions:   shape [len(link_names), 3], dtype float32
+            quaternions: shape [len(link_names), 4], dtype float64, [w, x, y, z]
+        """
+        n = len(link_names)
+        positions = np.zeros((n, 3), dtype=np.float32)
+        quaternions = np.zeros((n, 4), dtype=np.float64)
+        for i, name in enumerate(link_names):
+            link = self._link_cache.get(name)
+            if link is None:
+                link = self.robot.find_link_by_name(name)
+                if link is None:
+                    raise ValueError(f"Link '{name}' not found")
+                self._link_cache[name] = link
+            pose = link.get_entity_pose()
+            positions[i] = pose.p
+            quaternions[i] = pose.q
+        return positions, quaternions
+```
+
+**为什么新增方法而不改 `get_link_positions`**:
+
+`get_link_positions` 的签名 `→ np.ndarray` 被以下调用方依赖：
+- `keypoint_extractor.py` L67-68
+- `test_fk_home.py`
+- `test_extract_single.py`
+
+若将其返回值改为 `Tuple[np.ndarray, np.ndarray]`，所有调用方都需要改为解包 `pos, quat = ...` 的形式，违背「不改已有代码」原则。新增 `get_link_poses` 是标准的 OOP 扩展，不影响任何已有调用。
+
+**复用说明**: 该方法内部的 link 查找逻辑（包括 `_link_cache` 缓存机制）与 `get_link_positions` 完全相同，仅多取了 `pose.q`。
+
+### 15.3 `eef_calculator.py` — 新增 `compute_tcp_pose()` 函数
+
+**变更位置**: 文件末尾，在现有 `compute_tcp_position` 函数（L11-26）之后追加。
+
+**新增函数**:
+
+```python
+def compute_tcp_pose(
+    ee_joint_pos: np.ndarray,
+    ee_joint_quat: np.ndarray,
+    gripper_bias: float = GRIPPER_BIAS,
+    global_trans_matrix: np.ndarray = GLOBAL_TRANS_MATRIX,
+    delta_matrix: np.ndarray = DELTA_MATRIX,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute EEF TCP world position AND orientation quaternion.
+
+    Extends compute_tcp_position() to also return the TCP frame
+    orientation as a unit quaternion.
+
+    TCP rotation:  R_tcp = R_ee @ G @ D
+    TCP position:  p_tcp = p_ee + R_tcp @ [bias, 0, 0]
+    TCP quaternion: q_tcp = mat2quat(R_tcp)
+
+    Matches RoboTwin robot.py:_trans_endpose (lines 622-637).
+
+    Args:
+        ee_joint_pos:  [3]  EE joint world position
+        ee_joint_quat: [4]  EE joint world quaternion [w, x, y, z]
+        gripper_bias:  TCP offset along transformed local X (m)
+        global_trans_matrix: [3,3] coordinate convention matrix
+        delta_matrix:        [3,3] additional rotation (identity for ALOHA)
+
+    Returns:
+        tcp_pos:  [3]  float32, TCP world position
+        tcp_quat: [4]  float64, TCP world quaternion [w, x, y, z]
+    """
+    ee_joint_pos = np.asarray(ee_joint_pos, dtype=np.float64)
+    ee_joint_quat = np.asarray(ee_joint_quat, dtype=np.float64)
+
+    rot_ee = t3d_quat.quat2mat(ee_joint_quat)
+    rot_tcp = rot_ee @ global_trans_matrix @ delta_matrix
+    tcp_offset = rot_tcp @ np.array([gripper_bias, 0.0, 0.0], dtype=np.float64)
+    tcp_pos = ee_joint_pos + tcp_offset
+    tcp_quat = t3d_quat.mat2quat(rot_tcp)
+    return tcp_pos.astype(np.float32), tcp_quat
+```
+
+**为什么不改 `compute_tcp_position`**: 与 `get_link_positions` / `get_link_poses` 同理——保持已有 API 签名不变。
+
+**为什么不需要新增 import**: 
+- `t3d_quat`（即 `transforms3d.quaternions`）已在文件 L6 导入，其中包含 `mat2quat` 函数。
+- `tuple[np.ndarray, np.ndarray]` 类型注解：因为文件已有 `from __future__ import annotations`（L3），所以 Python 3.10 以下也可使用小写 `tuple` 作注解，无需从 `typing` 导入 `Tuple`。
+
+**复用说明**: `compute_tcp_pose` 的前 4 行（计算 `rot_tcp` 和 `tcp_pos`）与 `compute_tcp_position` 完全相同，仅末尾多了一行 `mat2quat(rot_tcp)` 做四元数转换。虽有少量代码重复，但保持两个函数独立，避免给已有函数添加返回值参数或布尔开关等更具侵入性的改动。
+
+---
+
+## 十六. 新增文件详设
+
+### 16.1 `keypoint_pose_extractor.py` — 核心：关键点 + 位姿提取器
+
+**路径**: `b/script/kpt/keypoint_pose_extractor.py`
+
+**职责**: 继承 `KeypointExtractor`，在提取关键点位置的同时提取四元数姿态，追加保存 `keypoint_quats.npy`。
+
+#### 设计原则
+
+通过覆写父类的 4 个方法，在父类 `extract_all` 工作流的每个关键点「注入」四元数逻辑，**无需重写 `extract_all` 本身**：
+
+```mermaid
+sequenceDiagram
+    participant CLI as run_extract_with_pose.py
+    participant KPE as KeypointPoseExtractor
+    participant KE as KeypointExtractor (parent)
+    participant FK as AlohaFKScene
+
+    CLI ->> KPE: extract_all()
+    Note over KPE,KE: 父类 extract_all 内部循环
+    loop 每个 episode
+        KE ->> KPE: self.extract_episode(ep)
+        KPE ->> KPE: 清空 _current_ep_quats
+        KPE ->> KE: super().extract_episode(ep)
+        loop 每个时间步
+            KE ->> KPE: self._compute_step_keypoints(state)
+            KPE ->> FK: get_link_poses() → (pos, quat)
+            KPE ->> FK: get_joint_global_pose()
+            KPE ->> KPE: compute_tcp_pose() → (tcp_pos, tcp_quat)
+            KPE -->> KPE: 追加 quat 到 _current_ep_quats
+            KPE -->> KE: 返回 positions [K,3]
+        end
+        KPE ->> KPE: stack _current_ep_quats → _quat_cache[ep]
+    end
+    Note over KPE,KE: 父类 extract_all 保存阶段
+    loop 每个 episode
+        KE ->> KPE: self._save_episode_keypoints(ep, pos_flat)
+        KPE ->> KE: super()._save_episode_keypoints → 保存 keypoints.npy
+        KPE ->> KPE: 保存 keypoint_quats.npy
+    end
+    KE ->> KPE: self._save_meta(...)
+    KPE ->> KE: super()._save_meta → 保存标准 meta
+    KPE ->> KPE: 追加四元数字段到 meta
+```
+
+#### 完整代码
+
+```python
+"""Keypoint + pose (quaternion) extraction, extending KeypointExtractor."""
+
+from __future__ import annotations
+
+import json
+from typing import Dict, List, Optional
+
+import numpy as np
+
+from .config import (
+    K,
+    LEFT_ARM_LINK_NAMES,
+    LEFT_EE_JOINT_NAME,
+    QUAT_CONVENTION,
+    QUAT_DIM,
+    QUAT_FILENAME,
+    RIGHT_ARM_LINK_NAMES,
+    RIGHT_EE_JOINT_NAME,
+)
+from .eef_calculator import compute_tcp_pose
+from .keypoint_extractor import KeypointExtractor
+
+
+class KeypointPoseExtractor(KeypointExtractor):
+    """Extract 3D keypoint positions AND orientation quaternions.
+
+    Inherits all position-extraction and offset logic from KeypointExtractor.
+    Adds per-keypoint quaternion output saved as a separate .npy file
+    alongside the existing keypoints.npy.
+
+    Output per episode:
+        keypoints.npy       — [T, K*3] float32  (positions, from parent)
+        keypoint_quats.npy  — [T, K*4] float32  (quaternions, this class)
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._quat_cache: Dict[int, np.ndarray] = {}
+        self._current_ep_quats: List[np.ndarray] = []
+
+    # ---- Override 1: FK now yields position + quaternion ----
+
+    def _compute_step_keypoints(self, state_14: np.ndarray) -> np.ndarray:
+        """Override: also extract link/TCP quaternions per step.
+
+        Returns positions [K, 3] (same interface as parent).
+        Side-effect: appends quaternion array [K, 4] to
+        self._current_ep_quats for later caching.
+        """
+        qpos = self.joint_mapper.map_state_to_qpos(state_14)
+        self.fk_scene.set_qpos(qpos)
+
+        # Positions + quaternions for arm links
+        left_pos, left_quat = self.fk_scene.get_link_poses(LEFT_ARM_LINK_NAMES)
+        right_pos, right_quat = self.fk_scene.get_link_poses(RIGHT_ARM_LINK_NAMES)
+
+        # TCP position + quaternion
+        left_ee_pos, left_ee_quat = self.fk_scene.get_joint_global_pose(
+            LEFT_EE_JOINT_NAME
+        )
+        right_ee_pos, right_ee_quat = self.fk_scene.get_joint_global_pose(
+            RIGHT_EE_JOINT_NAME
+        )
+        left_tcp_pos, left_tcp_quat = compute_tcp_pose(left_ee_pos, left_ee_quat)
+        right_tcp_pos, right_tcp_quat = compute_tcp_pose(right_ee_pos, right_ee_quat)
+
+        # Assemble positions (same layout as parent)
+        keypoints = np.zeros((K, 3), dtype=np.float32)
+        keypoints[:6] = left_pos
+        keypoints[6] = left_tcp_pos
+        keypoints[7:13] = right_pos
+        keypoints[13] = right_tcp_pos
+
+        # Assemble quaternions [K, 4], wxyz convention
+        quats = np.zeros((K, 4), dtype=np.float32)
+        quats[:6] = left_quat.astype(np.float32)
+        quats[6] = np.asarray(left_tcp_quat, dtype=np.float32)
+        quats[7:13] = right_quat.astype(np.float32)
+        quats[13] = np.asarray(right_tcp_quat, dtype=np.float32)
+        self._current_ep_quats.append(quats)
+
+        return keypoints
+
+    # ---- Override 2: cache quaternions after each episode ----
+
+    def extract_episode(self, episode_idx: int) -> np.ndarray:
+        self._current_ep_quats = []
+        keypoints = super().extract_episode(episode_idx)
+        self._quat_cache[episode_idx] = np.stack(self._current_ep_quats, axis=0)
+        self._current_ep_quats = []
+        return keypoints
+
+    # ---- Override 3: save quaternions alongside positions ----
+
+    def _save_episode_keypoints(
+        self, episode_idx: int, keypoints_flat: np.ndarray
+    ) -> None:
+        super()._save_episode_keypoints(episode_idx, keypoints_flat)
+        if episode_idx in self._quat_cache:
+            ep_dir = self.output_dir / f"episode_{episode_idx:06d}"
+            quats = self._quat_cache[episode_idx]
+            np.save(
+                ep_dir / QUAT_FILENAME,
+                quats.reshape(quats.shape[0], K * QUAT_DIM).astype(np.float32),
+            )
+
+    # ---- Override 4: meta includes quaternion info ----
+
+    def _save_meta(
+        self, offset, global_min, global_max, final_min, final_max, total_episodes
+    ) -> None:
+        super()._save_meta(
+            offset, global_min, global_max, final_min, final_max, total_episodes
+        )
+        meta_path = self.output_dir / "keypoints_meta.json"
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        meta.update(
+            {
+                "has_quaternions": True,
+                "quat_dim": QUAT_DIM,
+                "quat_convention": QUAT_CONVENTION,
+                "quat_filename": QUAT_FILENAME,
+                "quat_coord_frame": "world",
+                "quat_note": (
+                    "Quaternions are NOT affected by coord_offset "
+                    "(pure translation). They represent world-frame "
+                    "orientations of each link/TCP."
+                ),
+            }
+        )
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+```
+
+#### 设计解释
+
+**为什么用继承而非修改父类**:
+1. 已有 `run_extract.py` 和所有测试继续使用 `KeypointExtractor`，行为完全不变。
+2. 若下游只需位置（如 GeoPredict 当前版本），直接用父类即可，无需承担四元数提取开销。
+3. 子类通过 `super()` 调用父类方法，最大化复用，实际新增逻辑仅约 40 行。
+
+**为什么用 side-effect 模式（`_current_ep_quats` 列表）**: 父类 `extract_episode` 调用 `_compute_step_keypoints` 并将返回值（仅 `[K, 3]`）通过 `np.stack` 拼接。为保持返回值签名不变（不破坏父类 `extract_episode` 中的 `np.stack` 调用），子类通过实例变量 `_current_ep_quats` 在 `_compute_step_keypoints` 和 `extract_episode` 之间传递四元数数据。这是一种常见的 Template Method 模式的 side-channel。
+
+**OOP 覆写链的工作原理**: 父类 `extract_all`（L120-162）内部调用 `self.extract_episode`、`self._save_episode_keypoints`、`self._save_meta`。由于 Python 的方法分派机制，当 `self` 是 `KeypointPoseExtractor` 实例时，这三个调用会自动分派到子类的覆写版本，无需改动 `extract_all` 本身。
+
+### 16.2 `run_extract_with_pose.py` — 新 CLI 入口
+
+**路径**: `b/script/kpt/run_extract_with_pose.py`
+
+```python
+#!/usr/bin/env python3
+"""CLI entry for SAPIEN FK keypoint + pose (quaternion) extraction.
+
+Usage:
+    conda activate RoboTwin
+    cd /home/luogang/SRC/Robot/GeoPredict
+
+    # Full extraction (positions + quaternions)
+    python b/script/kpt/run_extract_with_pose.py \
+      --dataset_dir /path/to/task \
+      --output_dir  /path/to/task_kptsim
+
+    # Single episode debug
+    python b/script/kpt/run_extract_with_pose.py --episode 0
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[3]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from b.script.kpt.config import DATASET_DIR, OUTPUT_DIR, URDF_PATH
+from b.script.kpt.keypoint_pose_extractor import KeypointPoseExtractor
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Extract 3D keypoint positions + quaternions via SAPIEN FK"
+    )
+    parser.add_argument("--urdf_path", type=str, default=str(URDF_PATH))
+    parser.add_argument("--dataset_dir", type=str, default=str(DATASET_DIR))
+    parser.add_argument("--output_dir", type=str, default=str(OUTPUT_DIR))
+    parser.add_argument("--offset", type=float, nargs=3, default=None)
+    parser.add_argument("--episode", type=int, default=None)
+    args = parser.parse_args()
+
+    offset = None if args.offset is None else args.offset
+    extractor = KeypointPoseExtractor(
+        urdf_path=args.urdf_path,
+        dataset_dir=args.dataset_dir,
+        output_dir=args.output_dir,
+        offset=offset,
+    )
+    try:
+        if args.episode is not None:
+            kpts = extractor.extract_episode(args.episode)
+            print(
+                f"Episode {args.episode}: pos shape={kpts.shape}, "
+                f"min={kpts.min(axis=(0, 1))}, max={kpts.max(axis=(0, 1))}"
+            )
+            if args.episode in extractor._quat_cache:
+                quats = extractor._quat_cache[args.episode]
+                norms = np.linalg.norm(quats, axis=-1)
+                print(
+                    f"  quats: shape={quats.shape}, "
+                    f"norm range=[{norms.min():.6f}, {norms.max():.6f}]"
+                )
+        else:
+            extractor.extract_all()
+    finally:
+        extractor.close()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+**与 `run_extract.py` 的差异**: 仅两处——(1) import `KeypointPoseExtractor` 替代 `KeypointExtractor`；(2) 单 episode 模式额外打印四元数 shape 和范数。CLI 参数完全相同，使用方式一致。
+
+### 16.3 `validate_all_with_pose.py` — 扩展验收脚本
+
+**路径**: `b/script/kpt_tst/validate_all_with_pose.py`
+
+```python
+#!/usr/bin/env python3
+"""Acceptance validation for keypoints + quaternions.
+
+Reuses the position validation from validate_all.py, and adds
+quaternion-specific checks: file existence, format, unit-norm,
+frame-to-frame continuity.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[3]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from b.script.kpt.config import K, OUTPUT_DIR, QUAT_DIM, QUAT_FILENAME
+from b.script.kpt_tst.validate_all import validate_all as validate_positions
+
+
+def validate_quaternions(output_dir: Path = OUTPUT_DIR) -> bool:
+    """Validate quaternion data for all episodes."""
+    output_dir = Path(output_dir)
+    meta_path = output_dir / "keypoints_meta.json"
+    if not meta_path.exists():
+        print("[FAIL] Missing meta file")
+        return False
+
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    if not meta.get("has_quaternions", False):
+        print("[SKIP] No quaternion data (has_quaternions not set in meta)")
+        return True
+
+    total_episodes = meta["total_episodes"]
+    passed = True
+    max_norm_err_all = 0.0
+
+    for ep_idx in range(total_episodes):
+        quat_path = output_dir / f"episode_{ep_idx:06d}" / QUAT_FILENAME
+        if not quat_path.exists():
+            print(f"[FAIL] Missing {quat_path}")
+            passed = False
+            continue
+
+        quats_flat = np.load(quat_path)
+
+        # Format check
+        if quats_flat.dtype != np.float32 or quats_flat.shape[1] != K * QUAT_DIM:
+            print(
+                f"[FAIL] Bad quat format ep {ep_idx}: "
+                f"shape={quats_flat.shape}, dtype={quats_flat.dtype}"
+            )
+            passed = False
+            continue
+
+        quats = quats_flat.reshape(-1, K, QUAT_DIM)
+
+        # Unit-norm check: |norm - 1| < 1e-3
+        norms = np.linalg.norm(quats, axis=-1)
+        norm_err = np.abs(norms - 1.0).max()
+        max_norm_err_all = max(max_norm_err_all, norm_err)
+        if norm_err > 1e-3:
+            print(
+                f"[FAIL] Episode {ep_idx}: non-unit quaternion, "
+                f"max |norm-1|={norm_err:.6f}"
+            )
+            passed = False
+
+        # Continuity check (with hemisphere correction for q / -q ambiguity)
+        if quats.shape[0] > 1:
+            quats_c = quats.copy()
+            for t in range(1, quats_c.shape[0]):
+                for k in range(K):
+                    if np.dot(quats_c[t, k], quats_c[t - 1, k]) < 0:
+                        quats_c[t, k] = -quats_c[t, k]
+            diffs = np.linalg.norm(np.diff(quats_c, axis=0), axis=-1)
+            if diffs.max() > 0.3:
+                print(
+                    f"[WARN] Episode {ep_idx}: large quat step, "
+                    f"max diff={diffs.max():.4f} (threshold 0.3 ≈ 17°)"
+                )
+
+    print(f"[INFO] Max |norm-1| across all episodes: {max_norm_err_all:.6f}")
+
+    if passed:
+        print(f"[PASS] All {total_episodes} episodes quaternion checks passed")
+    else:
+        print("[FAIL] Some quaternion checks failed")
+    return passed
+
+
+def validate_all_with_pose(output_dir: Path = OUTPUT_DIR) -> bool:
+    """Run position validation (from parent script) + quaternion validation."""
+    print("=" * 60)
+    print("Phase 1: Position validation (validate_all)")
+    print("=" * 60)
+    pos_ok = validate_positions(output_dir)
+    print()
+    print("=" * 60)
+    print("Phase 2: Quaternion validation")
+    print("=" * 60)
+    quat_ok = validate_quaternions(output_dir)
+    return pos_ok and quat_ok
+
+
+def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Validate keypoints + quaternions")
+    parser.add_argument(
+        "--output_dir", type=str, default=str(OUTPUT_DIR),
+        help="kptsim output directory to validate"
+    )
+    args = parser.parse_args()
+    ok = validate_all_with_pose(Path(args.output_dir))
+    sys.exit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+**验收检查项**:
+
+| 检查项 | 阈值 | 说明 |
+|:---|:---|:---|
+| 文件存在 | 每 episode 均有 `keypoint_quats.npy` | — |
+| dtype | `float32` | 与 `keypoints.npy` 一致 |
+| shape | `[T, 56]` = `[T, K*4]` | — |
+| 单位范数 | $\lvert \|\mathbf{q}\|_2 - 1 \rvert < 10^{-3}$ | 四元数必须是单位四元数 |
+| 帧间连续性 | `max_diff < 0.3`（约 17°） | 需先做半球修正（$\mathbf{q}$ 和 $-\mathbf{q}$ 表示同一旋转） |
+
+**四元数连续性检查的半球修正**:
+
+四元数有符号模糊性：$\mathbf{q}$ 和 $-\mathbf{q}$ 表示同一旋转。直接计算 $\|\mathbf{q}_t - \mathbf{q}_{t-1}\|$ 可能因符号翻转导致假阳性。修正方法：
+
+$$\text{if } \mathbf{q}_t \cdot \mathbf{q}_{t-1} < 0 \text{, then } \mathbf{q}_t \leftarrow -\mathbf{q}_t$$
+
+修正后再计算差分范数。
+
+### 16.4 `test_extract_pose.py` — 集成测试
+
+**路径**: `b/script/kpt_tst/test_extract_pose.py`
+
+```python
+"""Integration test: extract episode 0 with positions + quaternions."""
+
+import numpy as np
+import pytest
+
+from b.script.kpt.config import DATASET_DIR, K, QUAT_DIM, QUAT_FILENAME, URDF_PATH
+from b.script.kpt.coord_transform import apply_offset, compute_auto_offset
+from b.script.kpt.keypoint_pose_extractor import KeypointPoseExtractor
+
+
+@pytest.fixture(scope="module")
+def extracted_pose(tmp_path_factory):
+    out_dir = tmp_path_factory.mktemp("kpt_pose")
+    extractor = KeypointPoseExtractor(
+        urdf_path=URDF_PATH,
+        dataset_dir=DATASET_DIR,
+        output_dir=out_dir,
+    )
+    kpts = extractor.extract_episode(0)
+    quats = extractor._quat_cache[0]
+    offset = compute_auto_offset(kpts.min(axis=(0, 1)), kpts.max(axis=(0, 1)))
+    kpts_t = apply_offset(kpts, offset)
+    extractor._save_episode_keypoints(0, kpts_t.reshape(kpts_t.shape[0], K * 3))
+    extractor.close()
+    return kpts, quats, out_dir
+
+
+class TestExtractPose:
+    def test_quat_shape_matches_position(self, extracted_pose):
+        """Quaternion array has same T and K as position array."""
+        kpts, quats, _ = extracted_pose
+        assert quats.shape[0] == kpts.shape[0]  # same T
+        assert quats.shape[1] == K
+        assert quats.shape[2] == QUAT_DIM
+
+    def test_quat_unit_norm(self, extracted_pose):
+        """All quaternions must be unit quaternions."""
+        _, quats, _ = extracted_pose
+        norms = np.linalg.norm(quats, axis=-1)
+        assert np.allclose(norms, 1.0, atol=1e-3)
+
+    def test_quat_file_saved(self, extracted_pose):
+        """keypoint_quats.npy is saved with correct shape and dtype."""
+        _, _, out_dir = extracted_pose
+        saved = np.load(out_dir / "episode_000000" / QUAT_FILENAME)
+        assert saved.dtype == np.float32
+        assert saved.shape[1] == K * QUAT_DIM
+
+    def test_position_shape_unchanged(self, extracted_pose):
+        """Positions from KeypointPoseExtractor match parent's format."""
+        kpts, _, _ = extracted_pose
+        assert kpts.shape[1] == K
+        assert kpts.shape[2] == 3
+
+    def test_quat_continuity(self, extracted_pose):
+        """Frame-to-frame quaternion change is smooth (with hemisphere fix)."""
+        _, quats, _ = extracted_pose
+        quats_c = quats.copy()
+        for t in range(1, quats_c.shape[0]):
+            for k in range(K):
+                if np.dot(quats_c[t, k], quats_c[t - 1, k]) < 0:
+                    quats_c[t, k] = -quats_c[t, k]
+        diffs = np.linalg.norm(np.diff(quats_c, axis=0), axis=-1)
+        assert diffs.max() < 0.3
+
+    def test_base_link_quat_stable(self, extracted_pose):
+        """Left arm base link (index 0) orientation should be nearly constant."""
+        _, quats, _ = extracted_pose
+        q_base = quats[:, 0, :]
+        q0 = q_base[0]
+        # Ensure same hemisphere
+        dots = np.einsum("ij,j->i", q_base, q0)
+        q_aligned = q_base.copy()
+        q_aligned[dots < 0] *= -1
+        drift = np.linalg.norm(q_aligned - q0, axis=1).max()
+        assert drift < 0.05
+```
+
+---
+
+## 十七. 运行步骤
+
+### 17.1 环境准备
+
+```bash
+# 激活 RoboTwin conda 环境 (已有 SAPIEN 3.0.0b1 + transforms3d)
+conda activate RoboTwin
+
+# 确认 SAPIEN 和 transforms3d 可用
+python -c "import sapien; print(sapien.__version__)"
+python -c "import transforms3d; print(transforms3d.__version__)"
+
+# 确认工作目录
+cd /home/luogang/SRC/Robot/GeoPredict
+```
+
+### 17.2 运行提取
+
+```bash
+# ---- 单 episode 调试 (推荐先跑一个确认输出正确) ----
+python b/script/kpt/run_extract_with_pose.py --episode 0
+
+# 预期输出:
+#   Episode 0: pos shape=(167, 14, 3), min=[...], max=[...]
+#     quats: shape=(167, 14, 4), norm range=[0.999998, 1.000001]
+
+
+# ---- scan_object 全量提取 ----
+python b/script/kpt/run_extract_with_pose.py \
+  --dataset_dir /home/luogang/share/zwy/Projects/DATA/RoboTwin-Clean/scan_object \
+  --output_dir  /home/luogang/share/zwy/Projects/DATA/RoboTwin-Clean/scan_object_kptsim
+
+
+# ---- hanging_mug 全量提取 ----
+python b/script/kpt/run_extract_with_pose.py \
+  --dataset_dir /home/luogang/share/zwy/Projects/DATA/RoboTwin-Clean/hanging_mug \
+  --output_dir  /home/luogang/share/zwy/Projects/DATA/RoboTwin-Clean/hanging_mug_kptsim
+
+
+# ---- stack_bowls_three 全量提取 ----
+python b/script/kpt/run_extract_with_pose.py \
+  --dataset_dir /home/luogang/share/zwy/Projects/DATA/RoboTwin-Clean/stack_bowls_three \
+  --output_dir  /home/luogang/share/zwy/Projects/DATA/RoboTwin-Clean/stack_bowls_three_kptsim
+```
+
+> **注意**: 如果 `OUTPUT_DIR` 已有附录一的 `keypoints.npy`，本脚本会**原地覆写** `keypoints.npy`（内容不变）并**追加** `keypoint_quats.npy`。不会删除已有文件。
+
+### 17.3 运行验收
+
+```bash
+# ---- 全量验收（位置 + 四元数） ----
+python b/script/kpt_tst/validate_all_with_pose.py \
+  --output_dir /home/luogang/share/zwy/Projects/DATA/RoboTwin-Clean/scan_object_kptsim
+
+# 预期输出:
+#   ============================================================
+#   Phase 1: Position validation (validate_all)
+#   ============================================================
+#   [INFO] Verified 50/50 episodes
+#   ...
+#   [PASS] All acceptance checks passed
+#
+#   ============================================================
+#   Phase 2: Quaternion validation
+#   ============================================================
+#   [INFO] Max |norm-1| across all episodes: 0.000001
+#   [PASS] All 50 episodes quaternion checks passed
+```
+
+### 17.4 运行测试
+
+```bash
+cd /home/luogang/SRC/Robot/GeoPredict
+
+# 运行新增的四元数测试
+python -m pytest b/script/kpt_tst/test_extract_pose.py -v
+
+# 运行所有测试（含已有测试 + 新增测试）
+python -m pytest b/script/kpt_tst/ -v
+```
+
+### 17.5 预期运行时间
+
+| 步骤 | 预期耗时 | 相比附录一的额外开销 |
+|:---|:---|:---|
+| URDF 加载 | ~2 s | 无额外开销 |
+| 单 episode 提取 | ~3–5 s | +~5%（多取 `.q`） |
+| 全量提取 (50 ep) | ~3–6 min | +~5% |
+| 验收脚本 | ~15 s | +~5 s（四元数检查） |
+
+开销增量极小，因为 `link.get_entity_pose()` 返回的 `sapien.Pose` 对象本身已包含 `.p` 和 `.q`，取 `.q` 几乎是零成本的字段访问。
+
+---
+
+## 十八. 下游使用示例
+
+### 18.1 加载位置 + 四元数
+
+```python
+import numpy as np
+
+# 加载
+positions   = np.load("keypoints.npy").reshape(-1, 14, 3)       # [T, K, 3]
+quaternions = np.load("keypoint_quats.npy").reshape(-1, 14, 4)   # [T, K, 4]
+
+# 第 t 步左臂 TCP 的完整位姿
+t = 100
+tcp_pos  = positions[t, 6]     # [3] — XYZ (体素空间，已减 offset)
+tcp_quat = quaternions[t, 6]   # [4] — [w, x, y, z] (世界系)
+```
+
+### 18.2 四元数转旋转矩阵
+
+```python
+from transforms3d.quaternions import quat2mat
+
+rot = quat2mat(tcp_quat)       # [3, 3] 旋转矩阵
+print("TCP local X axis in world:", rot[:, 0])   # 夹爪前方
+print("TCP local Z axis in world:", rot[:, 2])   # 夹爪正上方
+```
+
+### 18.3 用 scipy 时的约定转换
+
+```python
+from scipy.spatial.transform import Rotation
+
+# transforms3d / SAPIEN: [w, x, y, z]
+# scipy:                 [x, y, z, w]
+q_scipy = np.roll(tcp_quat, -1)         # wxyz → xyzw
+rot_scipy = Rotation.from_quat(q_scipy)
+euler = rot_scipy.as_euler("xyz", degrees=True)
+print(f"TCP Euler angles: {euler}")
+```
+
+### 18.4 与 GeoPredict 模型集成
+
+如果将四元数引入 GeoPredict 的 keypoint 分支，修改 `data_processing/robocasa_dataset.py` 中的 `__getitem__` 即可：
+
+```python
+# 在 load keypoints 之后追加:
+if (data_dir / ep_name / "keypoint_quats.npy").exists():
+    kpt_quats = np.load(data_dir / ep_name / "keypoint_quats.npy")  # [T, 56]
+    kpt_quats = kpt_quats.reshape(-1, self.joint_num, 4)            # [T, K, 4]
+    quat_t = torch.from_numpy(kpt_quats[step]).float()              # [K, 4]
+    obs_dict["kpt_quat"] = quat_t
+```
+
+模型侧在 `models/geopredict.py` 中增加一个线性投影：
+
+```python
+self.keypoint_quat_proj = nn.Linear(self.embed_dims, 4)   # 预测四元数
+```
+
+> 以上仅为集成思路示意，具体实施需另行设计。
+
+---
+
+## 十九. 注意事项与 FAQ
+
+### 19.1 已有 kptsim 目录的兼容性
+
+| 情况 | 行为 |
+|:---|:---|
+| 对空目录运行 `run_extract_with_pose.py` | 正常生成 `keypoints.npy` + `keypoint_quats.npy` |
+| 对已有附录一产物的目录运行 | `keypoints.npy` 被覆写（内容不变），`keypoint_quats.npy` 新增，meta 更新 |
+| 用 `run_extract.py`（附录一入口）对含四元数的目录运行 | `keypoints.npy` 被覆写（内容不变），`keypoint_quats.npy` 保留但可能与新位置不匹配 → **不推荐混用** |
+
+**建议**: 生成含四元数的 kptsim 时，始终使用 `run_extract_with_pose.py`，确保位置和四元数来自同一次 FK 计算。
+
+### 19.2 `scene.step()` 与四元数精度
+
+附录一 §10.4.3 和 LOG 中提到：对单帧孤立调用 `set_qpos` 后不从 episode 第 0 帧顺序回放，可能导致 `~5 cm` 的位置残余误差。这同样影响四元数——不按顺序回放的帧，其 link 四元数也可能有残余偏差。
+
+本方案中 `extract_episode` 始终**按帧顺序**调用 `set_qpos` + `scene.step()`（通过父类的循环），因此不受此问题影响。
+
+### 19.3 四元数的不连续「翻转」
+
+即使实际旋转平滑变化，四元数可能在 $w$ 分量过零点时发生符号翻转（因为 $\mathbf{q}$ 和 $-\mathbf{q}$ 表示同一旋转）。这不是 bug，而是四元数的固有双覆盖性质。
+
+如果下游需要连续的四元数轨迹（如用于插值或损失函数），应在加载后做半球修正：
+
+```python
+def ensure_continuous_quats(quats):
+    """Ensure consistent quaternion hemisphere across time."""
+    for t in range(1, quats.shape[0]):
+        if np.dot(quats[t], quats[t - 1]) < 0:
+            quats[t] = -quats[t]
+    return quats
+```
+
+本方案的 `keypoint_quats.npy` 存储的是**原始四元数**（不做半球修正），因为：
+1. 修正是有损操作（依赖遍历顺序），应由使用方按需执行。
+2. 不同下游可能有不同的约定偏好。
+
+### 19.4 link 四元数 vs joint 四元数
+
+本方案取的是 **link body frame** 的四元数（`link.get_entity_pose().q`），而非 joint frame 的四元数（`joint.global_pose.q`）。两者的区别：
+
+- **link body frame**: link 本体几何体的参考坐标系，用于碰撞检测和渲染。
+- **joint frame**: 关节的运动参考坐标系，用于运动学计算。
+
+对于 `fl_link1` ~ `fl_link6`，两者之间的差异取决于 URDF 中 `<joint>` 标签的 `<origin>` 偏移。在 GeoPredict 的应用场景中（初始化 3D Gaussian、描述工具朝向），link body frame 更合适。
+
+对于 TCP（索引 6 和 13），四元数来自 `joint.global_pose.q` 经 `global_trans_matrix` 变换后的结果，与 RoboTwin `_trans_endpose` 保持严格一致。
+
+### 19.5 换机器时的 checklist
+
+1. ☐ 激活 conda 环境：`conda activate RoboTwin`（或等价的含 SAPIEN 的环境）
+2. ☐ 确认 URDF 文件存在：`ls {URDF_PATH}` 路径可达
+3. ☐ 确认 URDF 的 mesh 文件存在（URDF 同目录下的 `meshes/` 文件夹）
+4. ☐ 确认输入数据集存在且格式正确：`ls {DATASET_DIR}/data/chunk-000/`
+5. ☐ 通过 CLI 参数 `--urdf_path`、`--dataset_dir`、`--output_dir` 指定正确路径
+6. ☐ 如需修改默认路径，编辑 `b/script/kpt/config.py` 的 `ROBOTWIN_ROOT`、`DATASET_DIR`、`OUTPUT_DIR`
+7. ☐ 先跑 `--episode 0` 验证单 episode 输出正确
+8. ☐ 全量提取后运行 `validate_all_with_pose.py` 验收
+
+---
+
+## 参考（附录二补充）
+
+8. `transforms3d` 库文档: https://matthew-brett.github.io/transforms3d/
+   - `quaternions.quat2mat(q)`: `[w,x,y,z]` → 3×3 旋转矩阵
+   - `quaternions.mat2quat(M)`: 3×3 旋转矩阵 → `[w,x,y,z]`
+9. SAPIEN Pose API: `sapien.Pose` 的 `.p` 返回 `[x,y,z]`，`.q` 返回 `[w,x,y,z]`
+10. 四元数双覆盖性质: $\mathbf{q}$ 和 $-\mathbf{q}$ 对应 SO(3) 中的同一旋转。参见 *Quaternions and Rotation Sequences* (Kuipers, 1999) Ch. 5

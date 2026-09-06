@@ -60,3 +60,8 @@ RIGHT_GRIPPER_STATE_IDX = 13
 VOXEL_RANGE_MIN = np.array([0.0, 0.0, 0.0], dtype=np.float32)
 VOXEL_RANGE_MAX = np.array([1.6, 1.6, 1.0], dtype=np.float32)
 VOXEL_CENTER = (VOXEL_RANGE_MIN + VOXEL_RANGE_MAX) / 2
+
+# ===== Quaternion output config (Appendix 2) =====
+QUAT_DIM = 4
+QUAT_CONVENTION = "wxyz"  # [w, x, y, z] Hamilton convention (SAPIEN / transforms3d)
+QUAT_FILENAME = "keypoint_quats.npy"
