@@ -2355,3 +2355,52 @@ KEYPOINT_BODY_NAMES = [
 | [robosuite 文档](https://robosuite.ai/) | Franka Panda MJCF、body 命名 |
 | MuJoCo 文档: `mj_forward`, `data.xpos`, `data.xquat` | FK API |
 | [RLDS 格式规范](https://github.com/google-research/rlds) | TFRecord episode 结构 |
+
+---
+
+## 十. 补充说明：为什么不需要 URDF
+
+### 10.1 不是不需要机器人模型，而是用 MJCF 替代了 URDF
+
+本方案看似没有 URDF 文件，但 `/tmp/panda_robosuite_full.xml`（Panda MJCF）**就是**本方案的"URDF"——它扮演完全相同的角色：提供机器人的连杆几何、关节类型、运动学链等信息，供 FK 引擎使用。没有它，FK 计算无从进行。
+
+两者的本质区别只是**文件格式**和**配套引擎**不同：
+
+| | 本方案 (MuJoCo) | R1Pro/Franka 方案 (Pinocchio) |
+|--|---|---|
+| FK 引擎 | `mujoco.mj_forward()` | `pin.forwardKinematics()` |
+| 机器人模型格式 | **MJCF** (`.xml`) | **URDF** (`.urdf`) |
+| 模型文件 | `/tmp/panda_robosuite_full.xml` | `r1_pro_with_gripper.urdf` |
+| 模型来源 | robosuite `env.sim.model.get_xml()` | ROS/制造商提供 |
+
+MJCF 和 URDF 都描述同一件事：连杆质量、几何形状、关节类型、运动学链。只是 MuJoCo 读 MJCF，Pinocchio 读 URDF。
+
+### 10.2 为什么选 MJCF 而不是 URDF
+
+**LIBERO 数据本身就是 MuJoCo 产生的。**
+
+数据采集时，robosuite 调用的正是这个 MuJoCo 模型，记录的 `observation/joint_state[7]` 正是 MuJoCo 内部的 `data.qpos[0:7]`。用同一个 MJCF 做 FK，能保证结果 **bit-exact**——实测误差为 $1.4 \times 10^{-17}$ m（浮点机器精度量级）。
+
+如果强行把 MJCF 转成 URDF 再喂给 Pinocchio，反而会引入额外风险：
+
+- 坐标系定义差异（MJCF 与 URDF 对关节坐标系的约定不完全一致）
+- 关节限位/阻尼参数转换误差
+- robosuite 特有命名前缀（`robot0_`、`gripper0_`）的兼容问题
+- MJCF → URDF 转换工具本身的精度损失
+
+### 10.3 MJCF 的获取方式
+
+MJCF 不是手工编写的，而是直接从 robosuite 运行时导出：
+
+```python
+import robosuite
+env = robosuite.make("Lift", robots="Panda", has_renderer=False)
+model_xml = env.sim.model.get_xml()   # 导出完整 MJCF
+env.close()
+```
+
+这保证了导出的模型与数据采集时使用的模型**完全一致**，包括 body 命名（`robot0_link1`～`robot0_link7`、`gripper0_eef`）、关节参数、底座偏置（$[-0.56, 0, 0.912]$ m）等所有细节。
+
+### 10.4 小结
+
+> **本方案"不需要 URDF"，是因为 MuJoCo 原生使用 MJCF 格式。MJCF 就是本方案的机器人模型文件，与其他方案中 URDF 的地位完全等同。选择 MJCF + MuJoCo 而非 URDF + Pinocchio，是因为 LIBERO 数据由 MuJoCo 生成，用同一引擎做 FK 可获得 bit-exact 的结果，避免格式转换引入的误差。**
